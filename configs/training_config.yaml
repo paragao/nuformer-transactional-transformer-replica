@@ -1,0 +1,158 @@
+# =============================================================================
+# nuFormer Training Configuration
+# =============================================================================
+# All three training stages: Pretrain (NTP) -> Finetune (LoRA) -> Joint Fusion
+#
+# Infrastructure: 6x p5en.48xlarge (48x H200, 141GB HBM3e each)
+# Container: NeMo 26.04 + EFA 1.48 + NCCL 2.30.4
+# =============================================================================
+
+# --- Pre-training: Next Token Prediction ---
+pretrain:
+  # Data
+  train_data_path: "data/processed/train_sequences.npy"
+  val_data_path: "data/processed/val_sequences.npy"
+  max_seq_len: 2048
+
+  # Model (330M)
+  vocab_size: 24078       # 78 special + 24000 BPE
+  d_model: 1024
+  n_layers: 24
+  n_heads: 16
+  d_ff: 4096
+  dropout: 0.1
+
+  # Optimization
+  batch_size: 16          # per GPU
+  gradient_accumulation_steps: 16
+  # Effective batch: 16 * 16 * 48 GPUs = 12,288 sequences
+  # Tokens per step: 12,288 * 2048 = ~25M tokens
+  max_steps: 50000
+  warmup_steps: 2000
+  learning_rate: 3.0e-4
+  min_lr: 3.0e-5
+  weight_decay: 0.1
+  grad_clip: 1.0
+  beta1: 0.9
+  beta2: 0.95
+
+  # Precision
+  dtype: "bfloat16"
+  compile_model: true     # torch.compile for kernel fusion
+
+  # Checkpointing
+  checkpoint_dir: "ckpt/pretrain"
+  save_interval: 2000
+  log_interval: 10
+  eval_interval: 500
+  eval_steps: 50
+
+
+# --- Fine-tuning: LoRA + Classification Head ---
+finetune:
+  # Data
+  train_data_path: "data/processed/train_sequences.npy"
+  train_labels_path: "data/processed/train_labels.npy"
+  val_data_path: "data/processed/val_sequences.npy"
+  val_labels_path: "data/processed/val_labels.npy"
+  max_seq_len: 2048
+
+  # Pre-trained model
+  pretrain_checkpoint: "ckpt/pretrain/final.pt"
+
+  # LoRA
+  lora_rank: 16
+  lora_alpha: 32.0
+  lora_target_modules:
+    - "qkv_proj"
+    - "out_proj"
+
+  # Optimization
+  batch_size: 32
+  gradient_accumulation_steps: 4
+  # Effective batch: 32 * 4 * 48 = 6,144
+  max_steps: 10000
+  warmup_steps: 500
+  learning_rate: 1.0e-4   # LoRA params
+  head_lr_multiplier: 5.0  # head gets 5e-4
+  min_lr: 1.0e-5
+  weight_decay: 0.01
+  grad_clip: 1.0
+  dtype: "bfloat16"
+
+  # Checkpointing
+  checkpoint_dir: "ckpt/finetune"
+  log_interval: 10
+  eval_interval: 200
+  save_interval: 1000
+  num_classes: 2
+
+
+# --- Joint Fusion: End-to-End nuFormer ---
+joint_fusion:
+  # Data
+  train_sequences_path: "data/processed/train_sequences.npy"
+  train_labels_path: "data/processed/train_labels.npy"
+  train_features_path: "data/processed/train_features.npy"
+  val_sequences_path: "data/processed/val_sequences.npy"
+  val_labels_path: "data/processed/val_labels.npy"
+  val_features_path: "data/processed/val_features.npy"
+  max_seq_len: 2048
+
+  # Pre-trained model
+  pretrain_checkpoint: "ckpt/pretrain/final.pt"
+
+  # DCNv2
+  num_tabular_features: 291
+  dcnv2_cross_layers: 3
+  dcnv2_deep_dims: [512, 256]
+  dcnv2_output_dim: 128
+  dcnv2_dropout: 0.1
+
+  # Fusion
+  fusion_hidden_dim: 256
+  fusion_dropout: 0.1
+  num_classes: 2
+
+  # LoRA
+  lora_rank: 16
+  lora_alpha: 32.0
+
+  # Component-specific learning rates (key paper design)
+  batch_size: 32
+  gradient_accumulation_steps: 4
+  max_steps: 20000
+  warmup_steps: 1000
+  transformer_lr: 5.0e-5    # Low: preserve pre-trained knowledge
+  dcnv2_lr: 1.0e-3          # High: learn feature interactions from scratch
+  fusion_lr: 5.0e-4         # Moderate: learn combination
+  min_lr_ratio: 0.1         # All LRs decay to 10% of peak
+  weight_decay: 0.01
+  dcnv2_weight_decay: 0.1   # Strong regularization on cross layers (paper finding)
+  grad_clip: 1.0
+  dtype: "bfloat16"
+
+  # Checkpointing
+  checkpoint_dir: "ckpt/joint_fusion"
+  log_interval: 10
+  eval_interval: 200
+  save_interval: 2000
+
+
+# --- MLFlow Tracking ---
+mlflow:
+  tracking_uri: "arn:aws:sagemaker:ap-southeast-3:159553542841:mlflow-tracking-server/paragao-mlflow-tracker"
+  experiment_name: "nuformer-replication"
+  aws_profile: "compute-sa-team-Administrator"
+  region: "ap-southeast-3"
+
+
+# --- Infrastructure ---
+infrastructure:
+  cluster: "p5en.smml.aiml.aws.dev"
+  nodes: 6
+  gpus_per_node: 8
+  gpu_type: "H200"
+  gpu_memory_gb: 141
+  container: "/fsx/containers/nuformer-efa.sqsh"
+  workspace: "/fsx/nuformer"
