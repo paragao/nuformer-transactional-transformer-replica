@@ -70,7 +70,7 @@ class PersonaGenerator:
 
         # Monthly income (from bracket distribution)
         mean, std = self.INCOME_PARAMS[income_bracket]
-        monthly_income = max(500, self.rng.normal(mean, std))
+        monthly_income = float(np.clip(self.rng.normal(mean, std), 500, 50000))
 
         # Risk profile (correlated with age)
         risk_probs = self.RISK_PROBS[age_group]
