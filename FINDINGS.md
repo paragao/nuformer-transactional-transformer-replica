@@ -81,7 +81,51 @@ Key design decisions:
 - **Normalization**: LayerNorm on transaction embeddings before concatenation
 - End-to-end training: Transformer + DCNv2 + MLP trained jointly
 
-### 2.3 Key Hyperparameters
+### 2.3 DCNv2: Deep & Cross Network v2
+
+**Paper**: Wang et al., "DCN V2: Improved Deep & Cross Network and Practical Lessons for Web-Scale Learning to Rank Systems", WWW 2021
+
+**Problem**: Neural networks are sample-inefficient at learning explicit feature interactions (e.g., `income × credit_limit`). Gradient-boosted trees get these for free via splitting; MLPs must discover them implicitly, requiring exponentially more data.
+
+**Solution**: A **Cross Network** that explicitly models bounded-degree polynomial feature interactions in a parameter-efficient way.
+
+**Architecture** (as used in nuFormer):
+```
+Tabular Features (291 dims)
+        |
+  ┌─────┴─────┐
+  |            |
+Cross Net   Deep Net (MLP)
+  |            |
+  └─────┬─────┘
+        |
+   Concat + Project → 128-dim embedding (for fusion with transformer)
+```
+
+**The Cross Layer formula**:
+```
+x_{l+1} = x_0 * (W_l @ x_l + b_l) + x_l
+```
+
+Where:
+- `x_0` = original input (always preserved across all layers)
+- `x_l` = output of previous cross layer
+- `W_l` = learned weight matrix (one per layer)
+- `*` = element-wise multiplication (this creates the feature crosses)
+
+**Key insight**: The element-wise multiplication of `x_0` with the transformed `x_l` creates explicit polynomial feature interactions. After `L` cross layers, the network captures interactions up to degree `L+1`. With 3 layers (our config), we get up to 4th-order feature crosses automatically (e.g., `income × utilization × payment_history × account_age`).
+
+**Why DCNv2 over just an MLP?**
+1. Inductive bias toward cross-feature patterns (no hoping the MLP discovers them)
+2. Parameter-efficient: one linear layer per cross layer vs exponential MLP width
+3. Bounded degree prevents overfitting to noise in high-order interactions
+4. Empirically matches/beats gradient-boosted trees on tabular benchmarks
+
+**In nuFormer**: The 291 tabular features (280 numerical + 11 categorical) are processed by DCNv2 to learn interactions like "high utilization + low income + recent missed payment" as explicit polynomial features. The 128-dim output is concatenated with the transformer's 1024-dim transaction embedding for joint prediction.
+
+**Critical regularization** (from paper ablation): Without weight decay (0.01) and dropout (0.1) on cross layers, DCNv2 overfits and performs *worse* than baseline (-0.40% AUC). With proper regularization + numerical embeddings, it reaches parity; combined with the transformer, it achieves the full +1.25% gain.
+
+### 2.4 Key Hyperparameters
 
 | Component | Values |
 |-----------|--------|
