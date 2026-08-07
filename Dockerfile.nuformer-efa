@@ -1,0 +1,162 @@
+# nuFormer Training Container
+# Base: NeMo 26.04 + EFA 1.48 + NCCL 2.30.4-1 (H200/sm_100)
+#
+# Build:
+#   docker build -t nuformer-efa:26.04 -f Dockerfile.nuformer-efa .
+#
+# Convert for Enroot (on Slurm cluster):
+#   enroot import -o /fsx/containers/nuformer-efa.sqsh dockerd://nuformer-efa:26.04
+#
+# Reference: https://github.com/awslabs/awsome-distributed-ai/blob/main/micro-benchmarks/nccl-tests/nccl-tests.Dockerfile
+
+ARG NEMO_VERSION=26.04
+FROM nvcr.io/nvidia/nemo:${NEMO_VERSION}
+
+ARG GDRCOPY_VERSION=v2.5.2
+ARG EFA_INSTALLER_VERSION=1.48.0
+ARG NCCL_VERSION=v2.30.4-1
+
+# -------------------------------------------------------------------
+# Remove outdated distro rdma-core and bundled NCCL (conflicts with EFA)
+# -------------------------------------------------------------------
+RUN apt-get update && apt-get remove -y --allow-change-held-packages \
+        ibverbs-utils \
+        libibverbs-dev \
+        libibverbs1 \
+        libmlx5-1 \
+        libnccl2 \
+        libnccl-dev \
+    && rm -rf /opt/hpcx /usr/local/mpi /etc/ld.so.conf.d/hpcx.conf \
+    && ldconfig
+
+ENV OPAL_PREFIX=
+
+# -------------------------------------------------------------------
+# Build dependencies
+# -------------------------------------------------------------------
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated \
+        apt-utils \
+        autoconf \
+        automake \
+        build-essential \
+        check \
+        cmake \
+        curl \
+        devscripts \
+        git \
+        gcc \
+        gdb \
+        kmod \
+        libsubunit-dev \
+        libtool \
+        openssh-client \
+        openssh-server \
+        pkg-config \
+        python3-distutils \
+    && apt-get purge -y cuda-compat-* \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /var/run/sshd
+RUN sed -i 's/[ #]\(.*StrictHostKeyChecking \).*/ \1no/g' /etc/ssh/ssh_config && \
+    echo "    UserKnownHostsFile /dev/null" >> /etc/ssh/ssh_config && \
+    sed -i 's/#\(StrictModes \).*/\1no/g' /etc/ssh/sshd_config
+
+# -------------------------------------------------------------------
+# Install NVIDIA GDRCopy
+# -------------------------------------------------------------------
+RUN git clone -b ${GDRCOPY_VERSION} https://github.com/NVIDIA/gdrcopy.git /tmp/gdrcopy \
+    && cd /tmp/gdrcopy \
+    && make prefix=/opt/gdrcopy install \
+    && rm -rf /tmp/gdrcopy
+
+ENV LD_LIBRARY_PATH=/opt/gdrcopy/lib:$LD_LIBRARY_PATH
+ENV LIBRARY_PATH=/opt/gdrcopy/lib:$LIBRARY_PATH
+ENV CPATH=/opt/gdrcopy/include:$CPATH
+ENV PATH=/opt/gdrcopy/bin:$PATH
+
+# -------------------------------------------------------------------
+# Install EFA installer (full mode, not NGC-detect)
+# --disable-build-ngc: forces full install on NGC base images so that
+# libfabric1-aws's deps (libibverbs1, ibverbs-providers >= 59) are
+# satisfied from the EFA bundle rather than the removed distro packages.
+# -------------------------------------------------------------------
+RUN cd /tmp \
+    && curl -O https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz \
+    && tar -xf aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz \
+    && cd aws-efa-installer \
+    && ./efa_installer.sh -y -g -d --skip-kmod --skip-limit-conf --no-verify --disable-build-ngc \
+    && rm -rf /tmp/aws-efa-installer*
+
+# Verify OFI NCCL plugin was installed
+RUN echo "Verifying AWS OFI NCCL plugin installation..." && \
+    (ls -la /opt/amazon/ofi-nccl/lib/libnccl-net*.so || \
+     ls -la /opt/amazon/ofi-nccl/lib/x86_64-linux-gnu/libnccl-ofi*.so || \
+     ls -la /opt/amazon/ofi-nccl/lib/aarch64-linux-gnu/libnccl-ofi*.so)
+
+# -------------------------------------------------------------------
+# Install NCCL from source (with H200 sm_100 support)
+# -------------------------------------------------------------------
+RUN git clone -b ${NCCL_VERSION} https://github.com/NVIDIA/nccl.git /opt/nccl \
+    && cd /opt/nccl \
+    && make -j $(nproc) src.build CUDA_HOME=/usr/local/cuda \
+         NVCC_GENCODE="-gencode=arch=compute_80,code=sm_80 \
+                       -gencode=arch=compute_86,code=sm_86 \
+                       -gencode=arch=compute_89,code=sm_89 \
+                       -gencode=arch=compute_90,code=sm_90 \
+                       -gencode=arch=compute_100,code=sm_100 \
+                       -gencode=arch=compute_103,code=sm_103"
+
+# -------------------------------------------------------------------
+# Environment variables for EFA + NCCL
+# -------------------------------------------------------------------
+# EFA 1.48 ships the OFI NCCL plugin at /opt/amazon/ofi-nccl/lib/
+ENV LD_LIBRARY_PATH=/usr/local/cuda/extras/CUPTI/lib64:/opt/amazon/openmpi/lib:/opt/nccl/build/lib:/opt/amazon/efa/lib:/opt/amazon/ofi-nccl/lib:/opt/amazon/ofi-nccl/lib/x86_64-linux-gnu:/opt/amazon/ofi-nccl/lib/aarch64-linux-gnu:/usr/local/lib:$LD_LIBRARY_PATH
+ENV PATH=/opt/amazon/openmpi/bin:/opt/amazon/efa/bin:/usr/bin:/usr/local/bin:$PATH
+
+# EFA provider
+ENV FI_PROVIDER=efa
+
+# NCCL tuner plugin (shipped with EFA 1.48)
+ENV NCCL_TUNER_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-ofi-tuner.so
+ENV NCCL_P2P_NET_CHUNKSIZE=2097156
+
+# Open MPI settings (exclude loopback/docker interfaces)
+ENV OMPI_MCA_pml=^ucx \
+    OMPI_MCA_btl=tcp,self \
+    OMPI_MCA_btl_tcp_if_exclude=lo,docker0,veth_def_agent \
+    OPAL_PREFIX=/opt/amazon/openmpi \
+    NCCL_SOCKET_IFNAME=^docker,lo,veth
+
+# PMIx fix: https://github.com/open-mpi/ompi/issues/7516
+ENV PMIX_MCA_gds=hash
+
+# Preload NCCL
+ENV LD_PRELOAD=/opt/nccl/build/lib/libnccl.so
+
+# -------------------------------------------------------------------
+# Python dependencies for nuFormer
+# -------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+    mlflow==2.15.1 \
+    boto3 \
+    sagemaker \
+    polars>=1.0 \
+    pyarrow>=15.0 \
+    pydantic>=2.0 \
+    'tokenizers>=0.19' \
+    'flash-attn>=2.6.3' --no-build-isolation \
+    'transformer-engine[pytorch]>=1.13' \
+    hydra-core \
+    pyyaml \
+    fsspec \
+    s3fs \
+    tqdm
+
+# -------------------------------------------------------------------
+# Copy project code
+# -------------------------------------------------------------------
+WORKDIR /workspace/nuformer
+COPY . /workspace/nuformer/
+
+# Default entrypoint
+CMD ["bash"]

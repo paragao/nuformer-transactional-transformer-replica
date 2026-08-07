@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data (large files)
+data/raw/
+data/processed/
+data/validation/*.parquet
+*.bin
+*.idx
+*.sqsh
+
+# Model checkpoints
+ckpt/
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+
+# Logs
+logs/
+mlruns/
+wandb/
+*.log
+slurm-*.out
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.key
+credentials/
