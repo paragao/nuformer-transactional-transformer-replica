@@ -1,0 +1,48 @@
+# Data generation configuration
+# Run: PYTHONPATH=. python scripts/generate_data.py --config configs/data_config.yaml
+
+# === Validation Dataset (quick sanity check) ===
+validation:
+  num_users: 1000
+  min_transactions_per_user: 50
+  max_transactions_per_user: 2000
+  start_date: "2022-01-01"
+  end_date: "2024-06-30"
+  positive_rate: 0.15
+  output_dir: "data/validation"
+  seed: 42
+
+# === Development Dataset (fast iteration) ===
+dev:
+  num_users: 10000
+  min_transactions_per_user: 50
+  max_transactions_per_user: 2000
+  start_date: "2022-01-01"
+  end_date: "2024-06-30"
+  positive_rate: 0.15
+  output_dir: "data/raw/dev"
+  seed: 42
+
+# === Full Dataset (paper-scale: 100M transactions) ===
+full:
+  num_users: 100000
+  min_transactions_per_user: 500
+  max_transactions_per_user: 2000
+  start_date: "2022-01-01"
+  end_date: "2024-06-30"
+  positive_rate: 0.15
+  output_dir: "data/raw/full"
+  seed: 42
+  # Target: 100K users × ~1000 txns/user = 100M transactions
+
+# === Temporal Splits ===
+splits:
+  train_end_date: "2023-12-31"  # First 2 years (train)
+  val_end_date: "2024-03-31"    # Next 3 months (validation)
+  # test: 2024-04-01 to 2024-06-30 (last 3 months)
+
+# === Label Definition ===
+label:
+  task: "credit_card_activation"
+  window_days: 180  # predict 6 months forward
+  description: "Will the user activate a credit card within 6 months?"

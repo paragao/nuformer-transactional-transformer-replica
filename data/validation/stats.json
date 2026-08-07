@@ -1,0 +1,23 @@
+{
+  "num_users": 1000,
+  "num_transactions": 1627761,
+  "positive_rate": 0.203,
+  "avg_txns_per_user": 1627.761,
+  "num_features": 291,
+  "config": {
+    "num_users": 1000,
+    "min_transactions_per_user": 50,
+    "max_transactions_per_user": 2000,
+    "target_total_transactions": null,
+    "start_date": "2022-01-01",
+    "end_date": "2024-06-30",
+    "label_window_days": 180,
+    "positive_rate": 0.15,
+    "num_tabular_features": 291,
+    "output_dir": "data/validation",
+    "format": "parquet",
+    "seed": 42,
+    "train_end_date": "2023-12-31",
+    "val_end_date": "2024-03-31"
+  }
+}
