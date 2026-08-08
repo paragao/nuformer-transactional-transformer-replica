@@ -439,41 +439,79 @@ class PreTrainer:
     # ------------------------------------------------------------------
 
     def save_checkpoint(self, path: str):
-        """Save model checkpoint (rank 0 only)."""
-        if self.rank != 0:
-            return
-
+        """Save model checkpoint with proper FSDP state dict gathering."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
 
-        # Get raw model (unwrap FSDP/DDP)
-        model = self.model
-        if hasattr(model, "module"):
-            model = model.module
+        # For FSDP: gather full state dict on rank 0
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        state = {
-            "model": model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "step": self.step,
-            "config": self.config,
-        }
-        torch.save(state, path)
-        print(f"  Checkpoint saved: {path}")
+        if isinstance(self.model, FSDP):
+            from torch.distributed.fsdp import (
+                FullStateDictConfig,
+                StateDictType,
+            )
+
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, save_policy):
+                model_state = self.model.state_dict()
+                optim_state = FSDP.full_optim_state_dict(self.model, self.optimizer)
+        else:
+            model = self.model
+            if hasattr(model, "module"):
+                model = model.module
+            model_state = model.state_dict()
+            optim_state = self.optimizer.state_dict()
+
+        if self.rank == 0:
+            state = {
+                "model": model_state,
+                "optimizer": optim_state,
+                "step": self.step,
+                "config": self.config,
+            }
+            torch.save(state, path)
+            print(f"  Checkpoint saved: {path}")
+
+        # Barrier to ensure all ranks wait for save to complete
+        if self.distributed:
+            torch.distributed.barrier()
 
     def load_checkpoint(self, path: str):
-        """Resume from checkpoint."""
+        """Resume from checkpoint with proper FSDP state dict loading."""
         if not Path(path).exists():
             if self.rank == 0:
                 print(f"No checkpoint at {path}, starting fresh")
             return
 
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        model = self.model
-        if hasattr(model, "module"):
-            model = model.module
-        model.load_state_dict(ckpt["model"])
+        if self.rank == 0:
+            print(f"Loading checkpoint from {path}...")
 
-        self.optimizer.load_state_dict(ckpt["optimizer"])
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
+        if isinstance(self.model, FSDP):
+            from torch.distributed.fsdp import (
+                FullStateDictConfig,
+                StateDictType,
+            )
+
+            # Load model state
+            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT):
+                self.model.load_state_dict(ckpt["model"])
+
+            # Load optimizer state
+            optim_state = FSDP.optim_state_dict_to_load(
+                self.model, self.optimizer, ckpt["optimizer"]
+            )
+            self.optimizer.load_state_dict(optim_state)
+        else:
+            model = self.model
+            if hasattr(model, "module"):
+                model = model.module
+            model.load_state_dict(ckpt["model"])
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+
         self.step = ckpt["step"]
 
         if self.rank == 0:

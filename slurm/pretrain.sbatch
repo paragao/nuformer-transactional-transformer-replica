@@ -5,9 +5,10 @@
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=0
-#SBATCH --time=24:00:00
+#SBATCH --time=7-00:00:00
 #SBATCH --exclusive
-#SBATCH --output=/fsx/paragao/logs/pretrain_%j.log
+#SBATCH --account=smml
+#SBATCH --output=/fsx/paragao/logs/pretrain_%j.out
 #SBATCH --error=/fsx/paragao/logs/pretrain_%j.err
 
 # =============================================================================
@@ -76,6 +77,7 @@ mkdir -p logs
         export NCCL_SOCKET_IFNAME=^docker,lo,veth
         export CUDA_DEVICE_MAX_CONNECTIONS=1
         export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+        export NCCL_DEBUG=INFO
         export PYTHONPATH=$WORKSPACE
         export TORCHELASTIC_ERROR_FILE=/fsx/paragao/logs/elastic_error_\${SLURM_PROCID}.json
         cd $WORKSPACE && \
