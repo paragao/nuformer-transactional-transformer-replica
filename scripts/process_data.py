@@ -60,8 +60,8 @@ def process_users(
 ) -> dict:
     """Process all users into train/val splits.
 
-    Split is temporal: train uses transactions before train_end_date,
-    val uses transactions after.
+    Optimized: sorts once by (user_id, timestamp) then iterates groups
+    with zero per-user DataFrame operations.
     """
     # Get user list from labels
     user_ids = labels["user_id"].to_list()
@@ -70,7 +70,7 @@ def process_users(
         labels["activated_credit_card"].to_list(),
     ))
 
-    # Get features as numpy
+    # Get features as numpy (indexed by user_id)
     feature_cols = [c for c in features.columns if c != "user_id"]
     feature_user_ids = features["user_id"].to_list()
     feature_map = {}
@@ -78,25 +78,30 @@ def process_users(
     for i, uid in enumerate(feature_user_ids):
         feature_map[uid] = feature_array[i]
 
-    # Group transactions by user
-    print("  Grouping transactions by user...")
-    txn_groups = transactions.group_by("user_id").agg(pl.all())
+    # Sort transactions once by user_id + timestamp (fast in polars)
+    print("  Sorting transactions by user_id + timestamp...")
+    transactions = transactions.sort(["user_id", "timestamp"])
 
-    user_txn_map = {}
-    for row in txn_groups.iter_rows(named=True):
-        uid = row["user_id"]
-        # Reconstruct transaction list
-        n_txns = len(row["timestamp"])
-        txns = []
-        for i in range(n_txns):
-            txns.append({
-                "amount": row["amount"][i],
-                "timestamp": datetime.fromisoformat(row["timestamp"][i]),
-                "description": row["description"][i],
-            })
-        # Sort by timestamp
-        txns.sort(key=lambda t: t["timestamp"])
-        user_txn_map[uid] = txns
+    # Extract columns as numpy/lists for fast iteration
+    print("  Extracting columns for fast iteration...")
+    txn_user_ids = transactions["user_id"].to_numpy()
+    txn_amounts = transactions["amount"].to_numpy()
+    txn_timestamps = transactions["timestamp"].to_list()
+    txn_descriptions = transactions["description"].to_list()
+
+    # Find group boundaries using numpy (much faster than polars group_by + iter)
+    print("  Finding user group boundaries...")
+    change_mask = np.concatenate([[True], txn_user_ids[1:] != txn_user_ids[:-1]])
+    group_starts = np.where(change_mask)[0]
+    group_ends = np.concatenate([group_starts[1:], [len(txn_user_ids)]])
+
+    # Build user -> (start, end) index map
+    user_txn_ranges = {}
+    for idx in range(len(group_starts)):
+        uid = txn_user_ids[group_starts[idx]]
+        user_txn_ranges[uid] = (group_starts[idx], group_ends[idx])
+
+    print(f"  Found {len(user_txn_ranges):,} users with transactions")
 
     # Process each user
     print(f"  Processing {len(user_ids):,} users...")
@@ -106,14 +111,24 @@ def process_users(
     skipped = 0
 
     for i, uid in enumerate(user_ids):
-        if uid not in user_txn_map:
+        if uid not in user_txn_ranges:
             skipped += 1
             continue
 
-        txns = user_txn_map[uid]
-        if len(txns) < 5:  # minimum transactions threshold
+        start, end = user_txn_ranges[uid]
+        n_txns = end - start
+        if n_txns < 5:  # minimum transactions threshold
             skipped += 1
             continue
+
+        # Build transaction list from pre-sorted arrays (already sorted by timestamp)
+        txns = []
+        for j in range(start, end):
+            txns.append({
+                "amount": float(txn_amounts[j]),
+                "timestamp": datetime.fromisoformat(txn_timestamps[j]) if isinstance(txn_timestamps[j], str) else txn_timestamps[j],
+                "description": txn_descriptions[j],
+            })
 
         # Build token sequence
         sequence = sequence_builder.build_sequence(txns)

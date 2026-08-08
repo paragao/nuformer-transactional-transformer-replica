@@ -188,13 +188,9 @@ class TransactionTransformer(nn.Module):
         # Token embedding (NoPE: no positional encoding)
         x = self.embed_dropout(self.token_embedding(input_ids))
 
-        # Build attention mask for SDPA if needed
+        # Use causal attention (padding is handled via ignore_index in loss)
+        # Don't create combined masks to avoid NaN from all-masked positions
         attn_mask = None
-        if attention_mask is not None:
-            # Convert binary mask to additive mask for non-causal use
-            # For causal attention, we rely on is_causal=True in SDPA
-            # But if we have padding, we need to combine causal + padding mask
-            attn_mask = self._make_attention_mask(attention_mask, T)
 
         # Transformer blocks
         for block in self.blocks:
