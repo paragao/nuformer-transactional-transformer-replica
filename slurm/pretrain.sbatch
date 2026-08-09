@@ -8,6 +8,7 @@
 #SBATCH --time=7-00:00:00
 #SBATCH --exclusive
 #SBATCH --account=smml
+#SBATCH --exclude=p5en-dy-gpu-1
 #SBATCH --output=/fsx/paragao/logs/pretrain_%j.out
 #SBATCH --error=/fsx/paragao/logs/pretrain_%j.err
 

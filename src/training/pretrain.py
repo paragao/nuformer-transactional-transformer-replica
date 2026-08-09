@@ -245,15 +245,17 @@ class PreTrainer:
                 reduce_dtype=self.dtype,
                 buffer_dtype=self.dtype,
             )
+            # Use HYBRID_SHARD: FSDP within node, DDP (allreduce) across nodes
+            # More resilient to inter-node communication issues
             self.model = FSDP(
                 self.model,
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                sharding_strategy=ShardingStrategy.HYBRID_SHARD,
                 mixed_precision=mp_policy,
                 device_id=self.local_rank,
                 use_orig_params=True,  # needed for torch.compile compatibility
             )
             if self.rank == 0:
-                print("FSDP enabled (FULL_SHARD)")
+                print("FSDP enabled (HYBRID_SHARD)")
         except Exception as e:
             if self.rank == 0:
                 print(f"FSDP failed, falling back to DDP: {e}")
