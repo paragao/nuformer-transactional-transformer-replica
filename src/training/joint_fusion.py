@@ -21,10 +21,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+
+from src.training.pretrain import PretrainConfig
+
+# Allow torch.load to unpickle checkpoints saved from __main__
+sys.modules["__main__"].PretrainConfig = PretrainConfig
 
 
 @dataclass
@@ -59,25 +66,27 @@ class JointFusionConfig:
 
     # Fusion
     fusion_hidden_dim: int = 256
-    fusion_dropout: float = 0.1
+    fusion_dropout: float = 0.3
     num_classes: int = 2
 
     # LoRA
     lora_rank: int = 16
     lora_alpha: float = 32.0
+    freeze_transformer: bool = False  # If True, skip LoRA and freeze all transformer params
 
     # Optimization (different LRs per component)
     batch_size: int = 32
     gradient_accumulation_steps: int = 4
-    max_steps: int = 20_000
-    warmup_steps: int = 1000
-    transformer_lr: float = 5e-5
-    dcnv2_lr: float = 1e-3
-    fusion_lr: float = 5e-4
+    max_steps: int = 10_000
+    warmup_steps: int = 500
+    transformer_lr: float = 5e-6
+    dcnv2_lr: float = 1e-4
+    fusion_lr: float = 5e-5
     min_lr_ratio: float = 0.1
-    weight_decay: float = 0.01
-    dcnv2_weight_decay: float = 0.1  # stronger for cross layers (paper finding)
+    weight_decay: float = 0.05
+    dcnv2_weight_decay: float = 0.2  # stronger for cross layers
     grad_clip: float = 1.0
+    label_smoothing: float = 0.1
 
     # Precision
     dtype: str = "bfloat16"
@@ -249,21 +258,36 @@ class JointFusionTrainer:
             if self.rank == 0:
                 print("WARNING: No pre-trained checkpoint, training from scratch")
 
-        # Apply LoRA to transformer (freeze base, add adapters)
-        self.model.transformer = apply_lora(
-            self.model.transformer,
-            rank=self.config.lora_rank,
-            alpha=self.config.lora_alpha,
-        )
+        # Apply LoRA to transformer (freeze base, add adapters) — or freeze entirely
+        if self.config.freeze_transformer:
+            # Freeze all transformer params (use as fixed feature extractor)
+            for p in self.model.transformer.parameters():
+                p.requires_grad = False
+            if self.rank == 0:
+                print("Transformer FROZEN (feature extractor only)")
+        else:
+            self.model.transformer = apply_lora(
+                self.model.transformer,
+                rank=self.config.lora_rank,
+                alpha=self.config.lora_alpha,
+            )
 
         self.model.to(self.device)
 
+        # DDP wrapping
+        if self.distributed:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            self.model = DDP(self.model, device_ids=[self.local_rank])
+
         if self.rank == 0:
-            params = self.model.num_parameters()
+            raw_model = self.model.module if self.distributed else self.model
+            params = raw_model.num_parameters()
             trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             total = sum(p.numel() for p in self.model.parameters())
             print(f"Parameters: {params}")
             print(f"Trainable: {trainable:,} / {total:,} ({trainable/total*100:.1f}%)")
+            if self.distributed:
+                print(f"DDP enabled ({self.world_size} GPUs)")
 
     def _setup_data(self):
         """Setup data loaders."""
@@ -284,9 +308,17 @@ class JointFusionTrainer:
                 vocab_size=self.config.vocab_size,
             )
 
+        train_sampler = None
+        shuffle = True
+        if self.distributed:
+            from torch.utils.data.distributed import DistributedSampler
+            train_sampler = DistributedSampler(train_dataset, shuffle=True)
+            shuffle = False
+
         self.train_loader = DataLoader(
             train_dataset, batch_size=self.config.batch_size,
-            shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
+            shuffle=shuffle, sampler=train_sampler,
+            num_workers=4, pin_memory=True, drop_last=True,
         )
 
         val_seq = Path(self.config.val_sequences_path)
@@ -306,17 +338,23 @@ class JointFusionTrainer:
 
     def _setup_optimizer(self):
         """Component-specific optimizer with different LRs and weight decays."""
-        # Categorize parameters by component
-        lora_params = [p for n, p in self.model.transformer.named_parameters() if p.requires_grad]
-        dcnv2_params = list(self.model.dcnv2.parameters())
-        fusion_params = list(self.model.fusion_mlp.parameters()) + list(self.model.emb_norm.parameters())
+        raw_model = self.model.module if self.distributed else self.model
 
-        self.optimizer = torch.optim.AdamW([
-            {
+        # Categorize parameters by component
+        dcnv2_params = list(raw_model.dcnv2.parameters())
+        fusion_params = list(raw_model.fusion_mlp.parameters()) + list(raw_model.emb_norm.parameters())
+
+        param_groups = []
+
+        if not self.config.freeze_transformer:
+            lora_params = [p for n, p in raw_model.transformer.named_parameters() if p.requires_grad]
+            param_groups.append({
                 "params": lora_params,
                 "lr": self.config.transformer_lr,
                 "weight_decay": self.config.weight_decay,
-            },
+            })
+
+        param_groups.extend([
             {
                 "params": dcnv2_params,
                 "lr": self.config.dcnv2_lr,
@@ -329,11 +367,18 @@ class JointFusionTrainer:
             },
         ])
 
+        self.optimizer = torch.optim.AdamW(param_groups)
+
         if self.rank == 0:
-            print(f"Optimizer: 3 param groups "
-                  f"(transformer={self.config.transformer_lr}, "
-                  f"dcnv2={self.config.dcnv2_lr}, "
-                  f"fusion={self.config.fusion_lr})")
+            n_groups = len(param_groups)
+            if self.config.freeze_transformer:
+                print(f"Optimizer: {n_groups} param groups "
+                      f"(dcnv2={self.config.dcnv2_lr}, fusion={self.config.fusion_lr})")
+            else:
+                print(f"Optimizer: {n_groups} param groups "
+                      f"(transformer={self.config.transformer_lr}, "
+                      f"dcnv2={self.config.dcnv2_lr}, "
+                      f"fusion={self.config.fusion_lr})")
 
     def _get_lr_scale(self, step: int) -> float:
         """Cosine decay factor (applied to all groups)."""
@@ -411,7 +456,10 @@ class JointFusionTrainer:
         while self.step < cfg.max_steps:
             # Update LR (scale applied to base LRs)
             lr_scale = self._get_lr_scale(self.step)
-            base_lrs = [cfg.transformer_lr, cfg.dcnv2_lr, cfg.fusion_lr]
+            if cfg.freeze_transformer:
+                base_lrs = [cfg.dcnv2_lr, cfg.fusion_lr]
+            else:
+                base_lrs = [cfg.transformer_lr, cfg.dcnv2_lr, cfg.fusion_lr]
             for pg, base_lr in zip(self.optimizer.param_groups, base_lrs):
                 pg["lr"] = base_lr * lr_scale
 
@@ -430,7 +478,10 @@ class JointFusionTrainer:
 
                 with torch.amp.autocast("cuda", dtype=self.dtype, enabled=torch.cuda.is_available()):
                     output = self.model(input_ids, features, attention_mask)
-                    loss = F.cross_entropy(output["logits"], labels)
+                    loss = F.cross_entropy(
+                        output["logits"], labels,
+                        label_smoothing=cfg.label_smoothing,
+                    )
                     loss = loss / cfg.gradient_accumulation_steps
 
                 loss.backward()
@@ -474,9 +525,10 @@ class JointFusionTrainer:
         """Save full model checkpoint."""
         if self.rank != 0:
             return
+        raw_model = self.model.module if self.distributed else self.model
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         torch.save({
-            "model": self.model.state_dict(),
+            "model": raw_model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "step": self.step,
             "best_auc": self.best_auc,
@@ -495,8 +547,13 @@ def main():
 
     parser = argparse.ArgumentParser(description="nuFormer Joint Fusion Training")
     parser.add_argument("--pretrain-ckpt", default="ckpt/pretrain/final.pt")
-    parser.add_argument("--max-steps", type=int, default=20_000)
+    parser.add_argument("--max-steps", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--transformer-lr", type=float, default=5e-6)
+    parser.add_argument("--dcnv2-lr", type=float, default=1e-4)
+    parser.add_argument("--fusion-lr", type=float, default=5e-5)
+    parser.add_argument("--freeze-transformer", action="store_true",
+                        help="Freeze transformer (feature extractor only)")
     parser.add_argument("--checkpoint-dir", type=str, default="ckpt/joint_fusion")
     args = parser.parse_args()
 
@@ -504,6 +561,10 @@ def main():
         pretrain_checkpoint=args.pretrain_ckpt,
         max_steps=args.max_steps,
         batch_size=args.batch_size,
+        transformer_lr=args.transformer_lr,
+        dcnv2_lr=args.dcnv2_lr,
+        fusion_lr=args.fusion_lr,
+        freeze_transformer=args.freeze_transformer,
         checkpoint_dir=args.checkpoint_dir,
     )
 

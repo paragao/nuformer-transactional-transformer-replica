@@ -71,6 +71,9 @@ class DCNv2(nn.Module):
         super().__init__()
         self.config = config
 
+        # Input normalization (critical for un-standardized tabular features)
+        self.input_norm = nn.BatchNorm1d(config.input_dim)
+
         # Cross network
         self.cross_layers = nn.ModuleList([
             CrossLayer(config.input_dim, dropout=config.dropout)
@@ -105,6 +108,9 @@ class DCNv2(nn.Module):
         Returns:
             Feature embedding (B, output_dim)
         """
+        # Normalize input
+        x = self.input_norm(x)
+
         # Cross network
         x0 = x
         x_cross = x

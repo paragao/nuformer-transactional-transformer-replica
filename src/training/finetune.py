@@ -18,10 +18,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import sys
+import pickle
+import io
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+
+from src.training.pretrain import PretrainConfig
+
+# Ensure __main__ has PretrainConfig so torch.load can unpickle checkpoints
+# saved when pretrain.py ran as __main__
+sys.modules["__main__"].PretrainConfig = PretrainConfig
 
 
 @dataclass
@@ -430,7 +440,9 @@ def main():
     parser.add_argument("--pretrain-ckpt", default="ckpt/pretrain/final.pt")
     parser.add_argument("--max-steps", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.05)
+    parser.add_argument("--head-lr-multiplier", type=float, default=2.0)
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--checkpoint-dir", type=str, default="ckpt/finetune")
     args = parser.parse_args()
@@ -440,6 +452,8 @@ def main():
         max_steps=args.max_steps,
         batch_size=args.batch_size,
         learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        head_lr_multiplier=args.head_lr_multiplier,
         lora_rank=args.lora_rank,
         checkpoint_dir=args.checkpoint_dir,
     )
