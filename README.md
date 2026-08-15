@@ -200,15 +200,28 @@ Generates 300K synthetic financial users with:
 - 291 tabular features (280 numerical + 11 one-hot categorical)
 - Binary fraud labels (~5% positive rate)
 
-### Step 3: Process Data
+### Step 3: Train Tokenizer
+
+```bash
+sbatch slurm/train_tokenizer.sbatch
+```
+
+Trains a BPE tokenizer (24K vocab) on transaction descriptions and saves to `tokenizer/tokenizer.json`.
+This tokenizer is used by all downstream scripts (processing, inference).
+
+> **Note**: A pre-trained tokenizer is included in the repo at `tokenizer/tokenizer.json`.
+> You only need to re-run this step if the transaction corpus changes.
+
+### Step 4: Process Data
 
 ```bash
 sbatch slurm/process_data.sbatch
 ```
 
 Converts raw data to numpy arrays (`train_sequences.npy`, `train_features.npy`, `train_labels.npy`, etc.) with train/val split.
+Supports loading the saved tokenizer via `--tokenizer tokenizer/tokenizer.json`.
 
-### Step 4: Pre-training (Self-Supervised)
+### Step 5: Pre-training (Self-Supervised)
 
 ```bash
 sbatch slurm/pretrain.sbatch
@@ -219,7 +232,7 @@ sbatch slurm/pretrain.sbatch
 - **Result**: Converges to PPL=1.6 (val_loss=0.4817), early stops at step 6,000
 - **Output**: `ckpt/pretrain/final.pt`
 
-### Step 5: Fine-tuning (Optional Baseline)
+### Step 6: Fine-tuning (Optional Baseline)
 
 ```bash
 sbatch slurm/finetune.sbatch
@@ -232,7 +245,7 @@ sbatch slurm/finetune.sbatch
 
 This establishes a transformer-only baseline. Joint Fusion significantly surpasses this.
 
-### Step 6: Joint Fusion Training
+### Step 7: Joint Fusion Training
 
 ```bash
 sbatch slurm/joint_fusion.sbatch
@@ -249,10 +262,31 @@ For the enhanced v2 configuration (AUC=0.8941):
 sbatch slurm/joint_fusion_v2.sbatch
 ```
 
-### Step 7: Evaluation
+### Step 8: Evaluation
 
 ```bash
 python scripts/evaluate.py --checkpoint ckpt/joint_fusion/best.pt
+```
+
+### Step 9: Batch Inference
+
+```bash
+sbatch slurm/inference.sbatch
+```
+
+Runs inference on raw (non-tokenized) transaction data using the trained model. Accepts
+transactions.parquet + tabular_features.parquet, tokenizes on-the-fly, and outputs per-user
+fraud probabilities to `predictions/`.
+
+Alternatively, run directly:
+
+```bash
+python scripts/batch_inference.py \
+    --checkpoint ckpt/joint_fusion_v2/best.pt \
+    --tokenizer tokenizer/tokenizer.json \
+    --transactions data/raw_300k/transactions.parquet \
+    --features data/raw_300k/tabular_features.parquet \
+    --output predictions.parquet
 ```
 
 ---
