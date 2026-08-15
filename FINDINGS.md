@@ -274,3 +274,35 @@ CUDA/PyTorch/NCCL stack.
 - Paper reports *relative* improvement over LightGBM; our baseline is transformer-only LoRA
 - Paper doesn't disclose absolute AUC values, making direct comparison impossible
 - Our replication validates the architecture and training methodology, not the exact numbers
+
+---
+
+## 9. Public Dataset Alternatives
+
+The nuFormer paper uses only Nubank internal data (203M training rows, 2M test rows, 291 tabular
+features, ~500B tokens). It does **not** release a public dataset. However, the papers it cites —
+particularly CoLES and NPPR — benchmark on publicly available transaction datasets:
+
+| Dataset | Source | Scale | Features | Task | Relevance |
+|---------|--------|-------|----------|------|-----------|
+| **Sberbank Age Prediction** | [Kaggle](https://www.kaggle.com/c/age-prediction-on-transaction-data) | 30K users, ~15M txns | Amount, MCC, date | Age bucket prediction | High — transaction sequences + classification |
+| **Rosbank Credit Default** | [Kaggle](https://www.kaggle.com/c/rosbank-ml-competition) | ~5K users | Amount, MCC, date, currency | Credit default | Very high — same task type as nuFormer |
+| **IBM Synthetic Fraud (AML)** | [Kaggle](https://www.kaggle.com/datasets/ealtman2019/ibm-transactions-for-anti-money-laundering-aml) | 6M+ txns | Amount, sender, receiver, timestamp | Fraud / AML detection | Medium — fraud but graph-structured |
+| **Czech Bank (Berka)** | [Relational Dataset Repository](https://relational-data.org/dataset/Financial) | 4.5K accounts, 1M txns | Amount, date, balance, type | Loan default | Medium — small but real financial data |
+| **PersonaLedger** | [arXiv:2601.03149](https://arxiv.org/abs/2601.03149) | 24.7M txns, 22K personas | Amount, merchant, date, description | Synthetic (no native label) | Medium — realistic distributions, no default label |
+
+### Recommendation
+
+**Rosbank Credit Default** is closest to the nuFormer task (credit default from transaction
+sequences), though small (~5K users). **Sberbank Age Prediction** is larger (30K users, 15M
+transactions) with richer sequences but a different label type.
+
+Neither dataset provides the 291 tabular features the paper uses (Nubank-internal bureau scores,
+derived aggregates, etc.). To replicate Joint Fusion with a public dataset, options are:
+
+1. Use Rosbank/Sberbank transactions for the transformer tower
+2. Engineer tabular features from the transactions (rolling aggregates, velocity, etc.)
+3. Supplement with bureau-like features from the Czech Bank dataset (account balance, loan info)
+
+This would sacrifice the "tabular features are orthogonal to transactions" property that the paper
+emphasizes, but would provide a fully reproducible public benchmark.
