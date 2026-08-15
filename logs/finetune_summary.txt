@@ -1,0 +1,49 @@
+# Fine-tuning (LoRA) Summary
+# Job ID: 11753
+# Instance: p5en.48xlarge (8x H200)
+# Date: Aug 2026
+
+## Configuration
+- Base model: ckpt/pretrain/final.pt (329M params)
+- LoRA rank: 16, alpha: 32
+- LoRA targets: Q, K, V projections
+- Trainable params: 2,359,296 LoRA + 527,874 head = 2,887,170 (0.88% of total)
+- Learning rate: 2e-5
+- Max steps: 5,000
+- Batch size: 32/GPU
+- Label smoothing: 0.1
+- Task: Binary fraud classification
+
+## Results
+- Best val_auc: 0.8296 at step 3,600
+- Best val_acc: 0.8345
+- Cancelled at step 4,000 (plateaued)
+- Checkpoint: ckpt/finetune/best.pt
+
+## Eval Progression
+step  200: val_loss=0.3850 | val_acc=0.8196 | val_auc=0.8056
+step  400: val_loss=0.3729 | val_acc=0.8293 | val_auc=0.8210
+step  600: val_loss=0.3685 | val_acc=0.8312 | val_auc=0.8246
+step  800: val_loss=0.3703 | val_acc=0.8312 | val_auc=0.8256
+step 1000: val_loss=0.3709 | val_acc=0.8300 | val_auc=0.8272
+step 1200: val_loss=0.3655 | val_acc=0.8335 | val_auc=0.8277
+step 1400: val_loss=0.3674 | val_acc=0.8325 | val_auc=0.8280
+step 1600: val_loss=0.3657 | val_acc=0.8328 | val_auc=0.8277
+step 1800: val_loss=0.3672 | val_acc=0.8317 | val_auc=0.8288
+step 2000: val_loss=0.3643 | val_acc=0.8337 | val_auc=0.8291
+step 2200: val_loss=0.3665 | val_acc=0.8337 | val_auc=0.8293
+step 2400: val_loss=0.3671 | val_acc=0.8324 | val_auc=0.8289
+step 2600: val_loss=0.3646 | val_acc=0.8337 | val_auc=0.8289
+step 2800: val_loss=0.3650 | val_acc=0.8335 | val_auc=0.8285
+step 3000: val_loss=0.3645 | val_acc=0.8338 | val_auc=0.8290
+step 3200: val_loss=0.3644 | val_acc=0.8339 | val_auc=0.8294
+step 3400: val_loss=0.3646 | val_acc=0.8337 | val_auc=0.8293
+step 3600: val_loss=0.3646 | val_acc=0.8342 | val_auc=0.8296  <-- best
+step 3800: val_loss=0.3644 | val_acc=0.8345 | val_auc=0.8295
+step 4000: val_loss=0.3646 | val_acc=0.8345 | val_auc=0.8288
+
+## Notes
+- Model plateaued around step 2000 (AUC ~0.829)
+- Very slow gains after step 1000 (+0.001 per 200 steps)
+- Demonstrates that transformer-only approach hits a ceiling on tabular-heavy tasks
+- Joint Fusion with DCNv2 provides +0.064 AUC improvement over this baseline

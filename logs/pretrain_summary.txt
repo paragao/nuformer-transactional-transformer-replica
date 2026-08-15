@@ -1,0 +1,31 @@
+# Pre-training Summary
+# Job ID: 11717
+# Instance: p5en.48xlarge (8x H200)
+# Date: Aug 2026
+
+## Configuration
+- Architecture: 24L, d_model=1024, n_heads=16, d_ff=4096
+- Positional encoding: None (NoPE)
+- Vocab size: 24,078
+- Max seq length: 2,048
+- Effective batch size: 6,144
+- Learning rate: 3e-4 (cosine decay)
+- Warmup steps: 500
+- Max steps: 25,000
+- Precision: BF16
+
+## Results
+- Best val_loss: 0.4817 (PPL=1.6) at step 3,500
+- Early stopped at step 6,000 (no improvement for 5 evals)
+- Checkpoint: ckpt/pretrain/final.pt
+
+## Eval Progression
+step 2500: loss=0.4824 ppl=1.6
+step 3000: loss=0.4819 ppl=1.6
+step 3500: loss=0.4817 ppl=1.6  <-- best
+step 4000: loss=0.4819 ppl=1.6
+step 4500: loss=0.4831 ppl=1.6
+step 5000: loss=0.4927 ppl=1.6
+step 5500: loss=0.4922 ppl=1.6
+step 6000: loss=0.5033 ppl=1.7
+[EARLY STOP] Stopping at step 6000

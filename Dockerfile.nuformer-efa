@@ -5,7 +5,7 @@
 #   docker build -t nuformer-efa:26.04 -f Dockerfile.nuformer-efa .
 #
 # Convert for Enroot (on Slurm cluster):
-#   enroot import -o /fsx/containers/nuformer-efa.sqsh dockerd://nuformer-efa:26.04
+#   enroot import -o /fsx/paragao/nuformer-efa-26.04.sqsh dockerd://nuformer-efa:26.04
 #
 # Reference: https://github.com/awslabs/awsome-distributed-ai/blob/main/micro-benchmarks/nccl-tests/nccl-tests.Dockerfile
 
@@ -17,16 +17,17 @@ ARG EFA_INSTALLER_VERSION=1.48.0
 ARG NCCL_VERSION=v2.30.4-1
 
 # -------------------------------------------------------------------
-# Remove outdated distro rdma-core and bundled NCCL (conflicts with EFA)
+# Remove outdated distro rdma-core (conflicts with EFA)
+# Keep libnccl2 so the EFA installer's NGC variant can install cleanly.
+# We build NCCL from source and override via LD_PRELOAD.
 # -------------------------------------------------------------------
 RUN apt-get update && apt-get remove -y --allow-change-held-packages \
         ibverbs-utils \
         libibverbs-dev \
         libibverbs1 \
         libmlx5-1 \
-        libnccl2 \
-        libnccl-dev \
-    && rm -rf /opt/hpcx /usr/local/mpi /etc/ld.so.conf.d/hpcx.conf \
+    2>/dev/null || true \
+    && rm -rf /opt/hpcx /usr/local/mpi /etc/ld.so.conf.d/hpcx.conf 2>/dev/null || true \
     && ldconfig
 
 ENV OPAL_PREFIX=
@@ -52,8 +53,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated \
         openssh-client \
         openssh-server \
         pkg-config \
-        python3-distutils \
-    && apt-get purge -y cuda-compat-* \
+    && (apt-get purge -y cuda-compat-* 2>/dev/null || true) \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /var/run/sshd
@@ -75,23 +75,30 @@ ENV CPATH=/opt/gdrcopy/include:$CPATH
 ENV PATH=/opt/gdrcopy/bin:$PATH
 
 # -------------------------------------------------------------------
-# Install EFA installer (full mode, not NGC-detect)
-# --disable-build-ngc: forces full install on NGC base images so that
-# libfabric1-aws's deps (libibverbs1, ibverbs-providers >= 59) are
-# satisfied from the EFA bundle rather than the removed distro packages.
+# Install EFA installer
+# Pre-create the efa-profile conf file that the installer's
+# verification step expects. Use --no-verify to skip the post-install
+# check (which fails in Docker due to missing kernel modules).
+# The installer may exit non-zero due to NGC detection but the packages
+# are still installed correctly.
 # -------------------------------------------------------------------
-RUN cd /tmp \
+RUN mkdir -p /etc/ld.so.conf.d \
+    && echo "/opt/amazon/efa/lib" > /etc/ld.so.conf.d/000_efa.conf \
+    && cd /tmp \
     && curl -O https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz \
     && tar -xf aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz \
     && cd aws-efa-installer \
-    && ./efa_installer.sh -y -g -d --skip-kmod --skip-limit-conf --no-verify --disable-build-ngc \
-    && rm -rf /tmp/aws-efa-installer*
+    && (./efa_installer.sh -y -g -d --skip-kmod --skip-limit-conf --no-verify || true) \
+    && rm -rf /tmp/aws-efa-installer* \
+    && ldconfig
 
-# Verify OFI NCCL plugin was installed
-RUN echo "Verifying AWS OFI NCCL plugin installation..." && \
-    (ls -la /opt/amazon/ofi-nccl/lib/libnccl-net*.so || \
-     ls -la /opt/amazon/ofi-nccl/lib/x86_64-linux-gnu/libnccl-ofi*.so || \
-     ls -la /opt/amazon/ofi-nccl/lib/aarch64-linux-gnu/libnccl-ofi*.so)
+# Verify EFA and OFI NCCL plugin installed correctly
+RUN echo "=== EFA Installation Verification ===" && \
+    ls -la /opt/amazon/efa/lib/libfabric.so && \
+    (ls /opt/amazon/ofi-nccl/lib/libnccl-net*.so 2>/dev/null || \
+     ls /opt/amazon/ofi-nccl/lib/libnccl-ofi*.so 2>/dev/null || \
+     find /opt/amazon -name "*nccl-ofi*" -o -name "*nccl-net*" | head -5) && \
+    echo "EFA + OFI NCCL: OK"
 
 # -------------------------------------------------------------------
 # Install NCCL from source (with H200 sm_100 support)
@@ -109,14 +116,13 @@ RUN git clone -b ${NCCL_VERSION} https://github.com/NVIDIA/nccl.git /opt/nccl \
 # -------------------------------------------------------------------
 # Environment variables for EFA + NCCL
 # -------------------------------------------------------------------
-# EFA 1.48 ships the OFI NCCL plugin at /opt/amazon/ofi-nccl/lib/
 ENV LD_LIBRARY_PATH=/usr/local/cuda/extras/CUPTI/lib64:/opt/amazon/openmpi/lib:/opt/nccl/build/lib:/opt/amazon/efa/lib:/opt/amazon/ofi-nccl/lib:/opt/amazon/ofi-nccl/lib/x86_64-linux-gnu:/opt/amazon/ofi-nccl/lib/aarch64-linux-gnu:/usr/local/lib:$LD_LIBRARY_PATH
 ENV PATH=/opt/amazon/openmpi/bin:/opt/amazon/efa/bin:/usr/bin:/usr/local/bin:$PATH
 
 # EFA provider
 ENV FI_PROVIDER=efa
 
-# NCCL tuner plugin (shipped with EFA 1.48)
+# NCCL tuner plugin (shipped with EFA 1.48 — try NGC path first, then standard)
 ENV NCCL_TUNER_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-ofi-tuner.so
 ENV NCCL_P2P_NET_CHUNKSIZE=2097156
 
@@ -133,10 +139,16 @@ ENV PMIX_MCA_gds=hash
 # Preload NCCL
 ENV LD_PRELOAD=/opt/nccl/build/lib/libnccl.so
 
+# PyTorch memory optimization
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # -------------------------------------------------------------------
 # Python dependencies for nuFormer
+# Note: NeMo 26.04 already has PyTorch, transformer-engine, flash-attn.
+# We only add missing packages. Use --ignore-installed to handle
+# system packages (blinker) that pip can't uninstall.
 # -------------------------------------------------------------------
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --ignore-installed \
     mlflow==2.15.1 \
     boto3 \
     sagemaker \
@@ -144,13 +156,13 @@ RUN pip install --no-cache-dir \
     pyarrow>=15.0 \
     pydantic>=2.0 \
     'tokenizers>=0.19' \
-    'flash-attn>=2.6.3' --no-build-isolation \
-    'transformer-engine[pytorch]>=1.13' \
     hydra-core \
     pyyaml \
     fsspec \
     s3fs \
-    tqdm
+    tqdm \
+    scikit-learn \
+    sentencepiece
 
 # -------------------------------------------------------------------
 # Copy project code

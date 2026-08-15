@@ -1,0 +1,64 @@
+# Joint Fusion v2 Summary
+# Job ID: 11758
+# Instance: p5en.48xlarge (8x H200)
+# Date: Aug 2026
+# Status: COMPLETE (early stopped at step 4000)
+
+## Configuration (changes vs v1 highlighted with *)
+- Base model: ckpt/pretrain/final.pt
+- PLR embedding dim: 16 per feature (8 sin + 8 cos) *
+- PLR frequencies: 8 *
+- DCNv2 cross layers: 5 *
+- DCNv2 deep layers: [1024, 512, 256] *
+- DCNv2 output dim: 128
+- Fusion MLP: 1152 -> 256 -> 256 -> 2
+- LoRA rank: 32, alpha: 32 *
+- Transformer LR: 5e-6
+- DCNv2+PLR LR: 5e-4 *
+- Fusion LR: 5e-5
+- Batch size: 64/GPU (effective 1024 with 8 GPUs x 2 grad accum)
+- Label smoothing: 0.05 *
+- Max steps: 8,000
+- Early stop patience: 5 evals (every 200 steps)
+
+## Results
+- Best val_auc: 0.8941 at step 3,000 (vs v1 best: 0.8938)
+- Best val_ap: 0.6337 at step 4,000 (vs v1 best: 0.6319)
+- Best val_loss: 0.3131 at step 3,000 (vs v1 best: 0.3345)
+- Early stopped at step 4,000 (faster than v1's 4,600)
+- Improvement over v1: +0.0003 AUC, +0.0018 AP, -0.0214 val_loss
+- Checkpoint: ckpt/joint_fusion_v2/best.pt
+- Full log: logs/joint_fusion_v2.log (on FSx)
+
+## Eval Progression
+step  200: val_loss=0.3321 | val_auc=0.8745 | val_ap=0.5910
+step  400: val_loss=0.3344 | val_auc=0.8853 | val_ap=0.6030
+step  600: val_loss=0.3474 | val_auc=0.8901 | val_ap=0.6172
+step  800: val_loss=0.3153 | val_auc=0.8908 | val_ap=0.6193
+step 1000: val_loss=0.3262 | val_auc=0.8912 | val_ap=0.6220
+step 1200: val_loss=0.3242 | val_auc=0.8925 | val_ap=0.6249
+step 1400: val_loss=0.3158 | val_auc=0.8925 | val_ap=0.6282
+step 1600: val_loss=0.3215 | val_auc=0.8923 | val_ap=0.6279
+step 1800: val_loss=0.3144 | val_auc=0.8928 | val_ap=0.6284
+step 2000: val_loss=0.3234 | val_auc=0.8933 | val_ap=0.6294
+step 2200: val_loss=0.3177 | val_auc=0.8930 | val_ap=0.6290
+step 2400: val_loss=0.3142 | val_auc=0.8934 | val_ap=0.6298
+step 2600: val_loss=0.3173 | val_auc=0.8938 | val_ap=0.6299
+step 2800: val_loss=0.3199 | val_auc=0.8937 | val_ap=0.6294
+step 3000: val_loss=0.3131 | val_auc=0.8941 | val_ap=0.6324  <-- best AUC
+step 3200: val_loss=0.3204 | val_auc=0.8935 | val_ap=0.6298
+step 3400: val_loss=0.3150 | val_auc=0.8936 | val_ap=0.6315
+step 3600: val_loss=0.3191 | val_auc=0.8938 | val_ap=0.6313
+step 3800: val_loss=0.3144 | val_auc=0.8936 | val_ap=0.6306
+step 4000: val_loss=0.3164 | val_auc=0.8939 | val_ap=0.6337  <-- best AP
+[EARLY STOP] No AUC improvement for 5 evals. Best: 0.8941
+
+## Analysis
+- V2 achieved a marginal AUC improvement (+0.0003) over v1
+- More significant gain in AP (+0.0018) and val_loss (-0.021)
+- Converged faster (best at step 3000 vs v1's step 3600)
+- Lower val_loss suggests better calibration from reduced label smoothing
+- The AUC ceiling of ~0.894 appears to be a data-level limitation rather than model capacity
+- Both v1 and v2 plateau in the same AUC range (0.893-0.894)
+- Larger PLR + deeper DCNv2 + higher LoRA rank did not significantly break through
+- Next steps: data augmentation, different loss functions, or more training data needed
