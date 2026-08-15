@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --account=smml
 #SBATCH --output=/fsx/paragao/logs/inference_%j.out
 #SBATCH --error=/fsx/paragao/logs/inference_%j.err
@@ -49,6 +49,7 @@ mkdir -p "$(dirname "$OUTPUT")"
     --container-mounts="/fsx:/fsx,$HOME:$HOME" \
     bash -c "
         export PYTHONPATH=$WORKSPACE
+        export PYTHONUNBUFFERED=1
         cd $WORKSPACE && \
         python scripts/batch_inference.py \
             --checkpoint $CHECKPOINT \

@@ -138,7 +138,7 @@ def load_transactions(path: str) -> dict[str, list[dict]]:
     print(f"  Loading transactions: {path}")
     df = pl.read_parquet(path, columns=["user_id", "timestamp", "amount", "description"])
 
-    # Parse timestamps and extract date components
+    # Parse timestamps and extract date components (vectorized — fast)
     ts_col = df["timestamp"]
     if ts_col.dtype == pl.Utf8:
         ts_col = ts_col.str.to_datetime()
@@ -149,31 +149,39 @@ def load_transactions(path: str) -> dict[str, list[dict]]:
     ])
     df = df.sort(["user_id", "timestamp"])
 
-    # Group by user
+    # Extract columns as numpy/lists for fast iteration (same pattern as process_data.py)
+    print(f"  Extracting columns for fast iteration...")
+    user_ids_arr = df["user_id"].to_numpy()
+    amounts = df["amount"].to_numpy()
+    months = df["month"].to_numpy()
+    days = df["day"].to_numpy()
+    weekdays = df["weekday"].to_numpy()
+    descriptions = df["description"].to_list()
+
+    # Find group boundaries using numpy
+    n_rows = len(user_ids_arr)
+    change_mask = np.concatenate([[True], user_ids_arr[1:] != user_ids_arr[:-1]])
+    group_starts = np.where(change_mask)[0]
+    group_ends = np.concatenate([group_starts[1:], [n_rows]])
+
+    # Build user -> transactions dict
     user_transactions = {}
-    current_uid = None
-    current_txns = []
+    for idx in range(len(group_starts)):
+        start, end = group_starts[idx], group_ends[idx]
+        uid = user_ids_arr[start]
+        txns = []
+        for j in range(start, end):
+            txns.append({
+                "amount": float(amounts[j]),
+                "month": int(months[j]),
+                "day": int(days[j]) ,
+                "weekday": int(weekdays[j]) - 1,  # polars 1-indexed → python 0-indexed
+                "description": descriptions[j],
+            })
+        user_transactions[uid] = txns
 
-    for row in df.iter_rows(named=True):
-        uid = row["user_id"]
-        if uid != current_uid:
-            if current_uid is not None:
-                user_transactions[current_uid] = current_txns
-            current_uid = uid
-            current_txns = []
-        current_txns.append({
-            "amount": float(row["amount"]),
-            "month": int(row["month"]),
-            "day": int(row["day"]),
-            "weekday": int(row["weekday"]) - 1,  # polars 1-indexed → python 0-indexed
-            "description": row["description"],
-        })
-
-    if current_uid is not None:
-        user_transactions[current_uid] = current_txns
-
-    print(f"  Loaded {len(user_transactions):,} users, "
-          f"{sum(len(v) for v in user_transactions.values()):,} transactions")
+    total_txns = sum(len(v) for v in user_transactions.values())
+    print(f"  Loaded {len(user_transactions):,} users, {total_txns:,} transactions")
     return user_transactions
 
 
@@ -265,7 +273,7 @@ def run_inference(
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             output = model(batch_seq, batch_feat, batch_mask)
 
-        probs = F.softmax(output["logits"], dim=-1)[:, 1]
+        probs = F.softmax(output["logits"].float(), dim=-1)[:, 1]
         all_probs.append(probs.cpu().numpy())
 
     elapsed = time.time() - t0
