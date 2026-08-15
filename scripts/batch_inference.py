@@ -32,6 +32,12 @@ import torch.nn.functional as F
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Allow torch.load to unpickle configs saved from training scripts
+from src.training.joint_fusion import JointFusionConfig
+from src.training.pretrain import PretrainConfig
+sys.modules["__main__"].JointFusionConfig = JointFusionConfig
+sys.modules["__main__"].PretrainConfig = PretrainConfig
+
 
 def load_model(checkpoint_path: str, device: torch.device) -> torch.nn.Module:
     """Load nuFormer model from joint fusion checkpoint."""
