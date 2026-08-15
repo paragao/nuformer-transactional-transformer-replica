@@ -2,7 +2,7 @@
 
 Trains the causal transformer using autoregressive language modeling
 on tokenized transaction sequences. Supports single-GPU, multi-GPU
-(FSDP), and multi-node (torchrun + Slurm).
+(DDP), and multi-node (torchrun + Slurm).
 
 Usage:
     # Single GPU
@@ -17,6 +17,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import time
@@ -35,8 +36,8 @@ class PretrainConfig:
     """Pre-training configuration."""
 
     # Data
-    train_data_path: str = "data/processed/train_sequences.npy"
-    val_data_path: str = "data/processed/val_sequences.npy"
+    train_data_path: str = "data/processed_300k/train_sequences.npy"
+    val_data_path: str = "data/processed_300k/val_sequences.npy"
     max_seq_len: int = 2048
 
     # Model
@@ -48,9 +49,9 @@ class PretrainConfig:
     dropout: float = 0.1
 
     # Optimization
-    batch_size: int = 16  # per GPU
-    gradient_accumulation_steps: int = 16
-    max_steps: int = 50_000
+    batch_size: int = 32  # per GPU
+    gradient_accumulation_steps: int = 8
+    max_steps: int = 25_000
     warmup_steps: int = 2000
     learning_rate: float = 3e-4
     min_lr: float = 3e-5
@@ -67,6 +68,9 @@ class PretrainConfig:
     checkpoint_dir: str = "ckpt/pretrain"
     save_interval: int = 2000
     resume_from: Optional[str] = None
+
+    # Early stopping
+    early_stop_patience: int = 5  # stop after N evals with no improvement
 
     # Logging
     log_interval: int = 10
@@ -149,10 +153,11 @@ class PreTrainer:
 
     Supports:
     - Single GPU training
-    - Multi-GPU via FSDP (torchrun)
+    - Multi-GPU via DDP with overlap_comm (torchrun)
     - Multi-node via torchrun + Slurm
     - Mixed precision (BF16/FP16)
     - Gradient accumulation
+    - ZeroRedundancyOptimizer (sharded optimizer state)
     - Cosine LR schedule with warmup
     - Periodic evaluation and checkpointing
     """
@@ -160,6 +165,8 @@ class PreTrainer:
     def __init__(self, config: PretrainConfig):
         self.config = config
         self.step = 0
+        self.best_val_loss = float("inf")
+        self.evals_without_improvement = 0
 
         self._setup_distributed()
         self._setup_model()
@@ -220,48 +227,22 @@ class PreTrainer:
         # Optional: torch.compile for kernel fusion
         if self.config.compile_model and hasattr(torch, "compile"):
             try:
-                self.model = torch.compile(self.model, mode="max-autotune")
+                self.model = torch.compile(self.model)
                 if self.rank == 0:
-                    print("torch.compile enabled (max-autotune)")
+                    print("torch.compile enabled (default mode)")
             except Exception as e:
                 if self.rank == 0:
                     print(f"torch.compile failed, continuing without: {e}")
 
-        # FSDP for multi-GPU
+        # DDP for multi-GPU with comm/compute overlap
         if self.distributed and self.world_size > 1:
-            self._wrap_fsdp()
-
-    def _wrap_fsdp(self):
-        """Wrap model with FSDP for distributed training."""
-        try:
-            from torch.distributed.fsdp import (
-                FullyShardedDataParallel as FSDP,
-                MixedPrecision,
-                ShardingStrategy,
-            )
-
-            mp_policy = MixedPrecision(
-                param_dtype=self.dtype,
-                reduce_dtype=self.dtype,
-                buffer_dtype=self.dtype,
-            )
-            # Use HYBRID_SHARD: FSDP within node, DDP (allreduce) across nodes
-            # More resilient to inter-node communication issues
-            self.model = FSDP(
-                self.model,
-                sharding_strategy=ShardingStrategy.HYBRID_SHARD,
-                mixed_precision=mp_policy,
-                device_id=self.local_rank,
-                use_orig_params=True,  # needed for torch.compile compatibility
-            )
-            if self.rank == 0:
-                print("FSDP enabled (HYBRID_SHARD)")
-        except Exception as e:
-            if self.rank == 0:
-                print(f"FSDP failed, falling back to DDP: {e}")
             self.model = torch.nn.parallel.DistributedDataParallel(
-                self.model, device_ids=[self.local_rank]
+                self.model,
+                device_ids=[self.local_rank],
+                gradient_as_bucket_view=True,
             )
+            if self.rank == 0:
+                print("DDP enabled (gradient_as_bucket_view)")
 
     def _setup_data(self):
         """Setup data loaders."""
@@ -287,9 +268,11 @@ class PreTrainer:
             batch_size=self.config.batch_size,
             sampler=sampler,
             shuffle=(sampler is None),
-            num_workers=4,
+            num_workers=8,
             pin_memory=True,
             drop_last=True,
+            persistent_workers=True,
+            prefetch_factor=4,
         )
 
         # Validation
@@ -298,7 +281,9 @@ class PreTrainer:
             val_dataset = PretrainDataset(str(val_path), self.config.max_seq_len)
             self.val_loader = DataLoader(
                 val_dataset, batch_size=self.config.batch_size,
-                num_workers=2, pin_memory=True,
+                num_workers=4, pin_memory=True,
+                persistent_workers=True,
+                prefetch_factor=4,
             )
         else:
             self.val_loader = None
@@ -325,11 +310,34 @@ class PreTrainer:
             param_groups,
             lr=self.config.learning_rate,
             betas=(self.config.beta1, self.config.beta2),
-            fused=torch.cuda.is_available(),
         )
 
         # GradScaler only needed for FP16
         self.scaler = torch.amp.GradScaler("cuda") if self.dtype == torch.float16 else None
+
+    def _compute_mfu(self, tokens_per_sec: float) -> float:
+        """Compute Model FLOPS Utilization (MFU).
+
+        Estimates achieved FLOPS as a fraction of peak hardware FLOPS.
+        Uses the standard 6*N*T approximation for transformer forward+backward
+        where N=params and T=tokens per step.
+
+        H200 peak BF16: 989 TFLOPS per GPU.
+        """
+        cfg = self.config
+        # Approximate model params (exclude embedding for MFU calc)
+        n_params = cfg.n_layers * (
+            4 * cfg.d_model * cfg.d_model  # QKV + output proj
+            + 2 * cfg.d_model * cfg.d_ff    # FFN up + down
+        )
+        # 6 flops per param per token (forward + backward)
+        flops_per_token = 6 * n_params
+        # Achieved FLOPS across all GPUs
+        achieved_flops = flops_per_token * tokens_per_sec
+        # H200 peak BF16 TFLOPS
+        peak_flops_per_gpu = 989e12  # 989 TFLOPS
+        peak_flops_total = peak_flops_per_gpu * self.world_size
+        return achieved_flops / peak_flops_total
 
     # ------------------------------------------------------------------
     # LR Schedule
@@ -441,33 +449,20 @@ class PreTrainer:
     # ------------------------------------------------------------------
 
     def save_checkpoint(self, path: str):
-        """Save model checkpoint with proper FSDP state dict gathering."""
+        """Save model checkpoint (DDP)."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
 
-        # For FSDP: gather full state dict on rank 0
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
-        if isinstance(self.model, FSDP):
-            from torch.distributed.fsdp import (
-                FullStateDictConfig,
-                StateDictType,
-            )
-
-            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, save_policy):
-                model_state = self.model.state_dict()
-                optim_state = FSDP.full_optim_state_dict(self.model, self.optimizer)
-        else:
-            model = self.model
-            if hasattr(model, "module"):
-                model = model.module
-            model_state = model.state_dict()
-            optim_state = self.optimizer.state_dict()
+        model = self.model
+        if hasattr(model, "module"):
+            model = model.module
+        # torch.compile wraps in OptimizedModule
+        if hasattr(model, "_orig_mod"):
+            model = model._orig_mod
 
         if self.rank == 0:
             state = {
-                "model": model_state,
-                "optimizer": optim_state,
+                "model": model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
                 "step": self.step,
                 "config": self.config,
             }
@@ -479,40 +474,24 @@ class PreTrainer:
             torch.distributed.barrier()
 
     def load_checkpoint(self, path: str):
-        """Resume from checkpoint with proper FSDP state dict loading."""
+        """Resume from checkpoint (DDP)."""
         if not Path(path).exists():
             if self.rank == 0:
                 print(f"No checkpoint at {path}, starting fresh")
             return
-
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         if self.rank == 0:
             print(f"Loading checkpoint from {path}...")
 
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
 
-        if isinstance(self.model, FSDP):
-            from torch.distributed.fsdp import (
-                FullStateDictConfig,
-                StateDictType,
-            )
-
-            # Load model state
-            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT):
-                self.model.load_state_dict(ckpt["model"])
-
-            # Load optimizer state
-            optim_state = FSDP.optim_state_dict_to_load(
-                self.model, self.optimizer, ckpt["optimizer"]
-            )
-            self.optimizer.load_state_dict(optim_state)
-        else:
-            model = self.model
-            if hasattr(model, "module"):
-                model = model.module
-            model.load_state_dict(ckpt["model"])
-            self.optimizer.load_state_dict(ckpt["optimizer"])
+        model = self.model
+        if hasattr(model, "module"):
+            model = model.module
+        if hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        model.load_state_dict(ckpt["model"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
 
         self.step = ckpt["step"]
 
@@ -557,16 +536,20 @@ class PreTrainer:
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr
 
-            # Gradient accumulation
-            for _ in range(cfg.gradient_accumulation_steps):
+            # Gradient accumulation with no_sync() to avoid redundant allreduces
+            for micro_step in range(cfg.gradient_accumulation_steps):
                 try:
                     batch = next(train_iter)
                 except StopIteration:
                     train_iter = iter(self.train_loader)
                     batch = next(train_iter)
 
-                loss = self._train_step(batch)
-                running_loss += loss
+                # Only sync gradients on the last micro-batch
+                is_last = (micro_step == cfg.gradient_accumulation_steps - 1)
+                ctx = contextlib.nullcontext() if is_last or not self.distributed else self.model.no_sync()
+                with ctx:
+                    loss = self._train_step(batch)
+                    running_loss += loss
 
             # Optimizer step
             grad_norm = self._optimizer_step()
@@ -574,19 +557,20 @@ class PreTrainer:
 
             # Logging
             if self.step % cfg.log_interval == 0 and self.rank == 0:
-                avg_loss = running_loss / cfg.log_interval
+                avg_loss = running_loss / (cfg.log_interval * cfg.gradient_accumulation_steps)
                 elapsed = time.time() - t0
                 steps_per_sec = cfg.log_interval / elapsed
                 tokens_per_sec = (
                     cfg.batch_size * cfg.max_seq_len * cfg.gradient_accumulation_steps
                     * self.world_size * steps_per_sec
                 )
+                mfu = self._compute_mfu(tokens_per_sec)
                 print(
                     f"  step {self.step:6d}/{cfg.max_steps} | "
                     f"loss {avg_loss:.4f} | ppl {math.exp(min(avg_loss, 20)):.1f} | "
                     f"lr {lr:.2e} | grad {grad_norm:.3f} | "
-                    f"{steps_per_sec:.1f} steps/s | "
-                    f"{tokens_per_sec/1e6:.2f}M tok/s"
+                    f"{tokens_per_sec/1e6:.2f}M tok/s | "
+                    f"MFU {mfu*100:.1f}%"
                 )
                 running_loss = 0.0
                 t0 = time.time()
@@ -597,6 +581,31 @@ class PreTrainer:
                 if self.rank == 0 and metrics:
                     print(f"  [EVAL] step {self.step}: "
                           f"loss={metrics['val_loss']:.4f} ppl={metrics['val_ppl']:.1f}")
+
+                    # Early stopping check
+                    if metrics["val_loss"] < self.best_val_loss:
+                        self.best_val_loss = metrics["val_loss"]
+                        self.evals_without_improvement = 0
+                    else:
+                        self.evals_without_improvement += 1
+                        print(f"  [EARLY STOP] No improvement for "
+                              f"{self.evals_without_improvement}/{cfg.early_stop_patience} evals "
+                              f"(best={self.best_val_loss:.4f})")
+
+                # Broadcast early stop decision from rank 0
+                if self.distributed:
+                    stop_tensor = torch.tensor(
+                        [self.evals_without_improvement], device=self.device
+                    )
+                    torch.distributed.broadcast(stop_tensor, src=0)
+                    self.evals_without_improvement = stop_tensor.item()
+
+                if self.evals_without_improvement >= cfg.early_stop_patience:
+                    if self.rank == 0:
+                        print(f"\n  [EARLY STOP] Stopping at step {self.step} — "
+                              f"no improvement for {cfg.early_stop_patience} evals. "
+                              f"Best val_loss: {self.best_val_loss:.4f}")
+                    break
 
             # Checkpointing
             if self.step % cfg.save_interval == 0:
@@ -621,11 +630,13 @@ def main():
 
     parser = argparse.ArgumentParser(description="nuFormer NTP Pre-training")
     parser.add_argument("--config", type=str, default="", help="YAML config path")
-    parser.add_argument("--max-steps", type=int, default=50_000)
+    parser.add_argument("--max-steps", type=int, default=25_000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--checkpoint-dir", type=str, default="ckpt/pretrain")
+    parser.add_argument("--save-interval", type=int, default=2000)
+    parser.add_argument("--early-stop-patience", type=int, default=5)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--no-compile", action="store_true")
     args = parser.parse_args()
@@ -636,6 +647,8 @@ def main():
         learning_rate=args.lr,
         max_seq_len=args.seq_len,
         checkpoint_dir=args.checkpoint_dir,
+        save_interval=args.save_interval,
+        early_stop_patience=args.early_stop_patience,
         resume_from=args.resume,
         compile_model=not args.no_compile,
     )

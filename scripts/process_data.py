@@ -21,6 +21,8 @@ import argparse
 import time
 from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 import numpy as np
 import polars as pl
@@ -50,6 +52,54 @@ def build_tokenizer(transactions: pl.DataFrame) -> DescriptionTokenizer:
     return tokenizer
 
 
+def _process_user_batch(args):
+    """Process a batch of users (for parallel execution).
+
+    Each worker gets: (user_ids_batch, txn_ranges, txn_amounts, txn_timestamps,
+                       txn_descriptions, label_map, feature_map, n_features,
+                       sequence_builder, max_seq_len)
+    """
+    (user_ids_batch, txn_ranges, txn_amounts, txn_timestamps,
+     txn_descriptions, label_map, feature_map, n_features,
+     sequence_builder, max_seq_len) = args
+
+    sequences = []
+    labels = []
+    features = []
+    skipped = 0
+
+    for uid in user_ids_batch:
+        if uid not in txn_ranges:
+            skipped += 1
+            continue
+
+        start, end = txn_ranges[uid]
+        n_txns = end - start
+        if n_txns < 5:
+            skipped += 1
+            continue
+
+        # Build transaction list
+        txns = []
+        for j in range(start, end):
+            ts = txn_timestamps[j]
+            txns.append({
+                "amount": float(txn_amounts[j]),
+                "timestamp": datetime.fromisoformat(ts) if isinstance(ts, str) else ts,
+                "description": txn_descriptions[j],
+            })
+
+        # Build and pad token sequence
+        sequence = sequence_builder.build_sequence(txns)
+        sequence = sequence_builder.pad_sequence(sequence, max_seq_len)
+
+        sequences.append(sequence)
+        labels.append(int(label_map.get(uid, False)))
+        features.append(feature_map.get(uid, np.zeros(n_features, dtype=np.float32)))
+
+    return sequences, labels, features, skipped
+
+
 def process_users(
     transactions: pl.DataFrame,
     labels: pl.DataFrame,
@@ -57,11 +107,12 @@ def process_users(
     sequence_builder: SequenceBuilder,
     max_seq_len: int,
     train_end_date: str = "2023-12-31",
+    num_workers: int = 0,
 ) -> dict:
     """Process all users into train/val splits.
 
     Optimized: sorts once by (user_id, timestamp) then iterates groups
-    with zero per-user DataFrame operations.
+    with zero per-user DataFrame operations. Supports multiprocessing.
     """
     # Get user list from labels
     user_ids = labels["user_id"].to_list()
@@ -82,12 +133,25 @@ def process_users(
     print("  Sorting transactions by user_id + timestamp...")
     transactions = transactions.sort(["user_id", "timestamp"])
 
+    # Pre-compute date components vectorized in polars (MUCH faster than per-row datetime.fromisoformat)
+    print("  Pre-computing date components (vectorized)...")
+    ts_col = transactions["timestamp"]
+    if ts_col.dtype == pl.Utf8:
+        ts_col = ts_col.str.to_datetime()
+    transactions = transactions.with_columns([
+        ts_col.dt.month().alias("_month"),
+        ts_col.dt.day().alias("_day"),
+        ts_col.dt.weekday().alias("_weekday"),  # 1=Monday ... 7=Sunday in polars
+    ])
+
     # Extract columns as numpy/lists for fast iteration
     print("  Extracting columns for fast iteration...")
     txn_user_ids = transactions["user_id"].to_numpy()
     txn_amounts = transactions["amount"].to_numpy()
-    txn_timestamps = transactions["timestamp"].to_list()
     txn_descriptions = transactions["description"].to_list()
+    txn_months = transactions["_month"].to_numpy()
+    txn_days = transactions["_day"].to_numpy()
+    txn_weekdays = transactions["_weekday"].to_numpy()  # polars: 1=Mon, need 0=Mon for Python
 
     # Find group boundaries using numpy (much faster than polars group_by + iter)
     print("  Finding user group boundaries...")
@@ -103,8 +167,15 @@ def process_users(
 
     print(f"  Found {len(user_txn_ranges):,} users with transactions")
 
-    # Process each user
-    print(f"  Processing {len(user_ids):,} users...")
+    # Determine workers
+    t_start = time.time()
+
+    if num_workers <= 0:
+        num_workers = 1  # serial is safest for large shared arrays
+
+    # Process users (serial — avoids pickling 479M-row arrays)
+    print(f"  Processing {len(user_ids):,} users (serial, optimized)...")
+
     all_sequences = []
     all_labels = []
     all_features = []
@@ -117,29 +188,35 @@ def process_users(
 
         start, end = user_txn_ranges[uid]
         n_txns = end - start
-        if n_txns < 5:  # minimum transactions threshold
+        if n_txns < 5:
             skipped += 1
             continue
 
-        # Build transaction list from pre-sorted arrays (already sorted by timestamp)
+        # Build transaction list using pre-computed date components (no datetime parsing)
         txns = []
         for j in range(start, end):
             txns.append({
                 "amount": float(txn_amounts[j]),
-                "timestamp": datetime.fromisoformat(txn_timestamps[j]) if isinstance(txn_timestamps[j], str) else txn_timestamps[j],
+                "month": int(txn_months[j]),
+                "day": int(txn_days[j]),
+                "weekday": int(txn_weekdays[j]) - 1,  # polars 1-indexed -> python 0-indexed
                 "description": txn_descriptions[j],
             })
 
-        # Build token sequence
-        sequence = sequence_builder.build_sequence(txns)
+        # Build and pad token sequence (uses optimized path)
+        sequence = sequence_builder.build_sequence_fast(txns)
         sequence = sequence_builder.pad_sequence(sequence, max_seq_len)
 
         all_sequences.append(sequence)
         all_labels.append(int(label_map.get(uid, False)))
         all_features.append(feature_map.get(uid, np.zeros(len(feature_cols), dtype=np.float32)))
 
-        if (i + 1) % 2000 == 0:
-            print(f"    {i + 1:,}/{len(user_ids):,} users processed")
+        if (i + 1) % 5000 == 0:
+            elapsed = time.time() - t_start
+            rate = (i + 1) / elapsed
+            eta = (len(user_ids) - i - 1) / rate
+            print(f"    {i + 1:,}/{len(user_ids):,} users | "
+                  f"{rate:.0f} users/s | ETA {eta/60:.0f} min")
 
     print(f"  Processed {len(all_sequences):,} users (skipped {skipped})")
 
@@ -182,6 +259,8 @@ def main():
     parser.add_argument("--output-dir", type=str, default="data/processed")
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--bpe-vocab-size", type=int, default=24000)
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Number of parallel workers (0 = auto-detect CPU count)")
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
@@ -191,6 +270,7 @@ def main():
     print(f"Input:  {input_dir}")
     print(f"Output: {output_dir}")
     print(f"Seq len: {args.max_seq_len}")
+    print(f"Workers: {args.workers if args.workers > 0 else 'auto'}")
     print()
 
     # Load data
@@ -222,6 +302,7 @@ def main():
     data = process_users(
         transactions, labels, features,
         sequence_builder, args.max_seq_len,
+        num_workers=args.workers,
     )
     print(f"  Tokenized in {time.time()-t0:.1f}s")
     print(f"  Train: {len(data['train_sequences']):,} users")

@@ -39,10 +39,10 @@ class FinetuneConfig:
     """Fine-tuning configuration."""
 
     # Data
-    train_data_path: str = "data/processed/train_sequences.npy"
-    train_labels_path: str = "data/processed/train_labels.npy"
-    val_data_path: str = "data/processed/val_sequences.npy"
-    val_labels_path: str = "data/processed/val_labels.npy"
+    train_data_path: str = "data/processed_300k/train_sequences.npy"
+    train_labels_path: str = "data/processed_300k/train_labels.npy"
+    val_data_path: str = "data/processed_300k/val_sequences.npy"
+    val_labels_path: str = "data/processed_300k/val_labels.npy"
     max_seq_len: int = 2048
 
     # Pre-trained model
@@ -62,14 +62,14 @@ class FinetuneConfig:
     lora_target_modules: list = None
 
     # Optimization
-    batch_size: int = 32
-    gradient_accumulation_steps: int = 4
-    max_steps: int = 10_000
-    warmup_steps: int = 500
-    learning_rate: float = 1e-4
-    head_lr_multiplier: float = 5.0
-    min_lr: float = 1e-5
-    weight_decay: float = 0.01
+    batch_size: int = 64
+    gradient_accumulation_steps: int = 2
+    max_steps: int = 5_000
+    warmup_steps: int = 300
+    learning_rate: float = 2e-5
+    head_lr_multiplier: float = 2.0
+    min_lr: float = 1e-6
+    weight_decay: float = 0.05
     grad_clip: float = 1.0
 
     # Precision

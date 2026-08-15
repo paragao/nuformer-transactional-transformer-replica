@@ -106,6 +106,63 @@ class SequenceBuilder:
 
         return sequence
 
+    def build_sequence_fast(
+        self,
+        transactions: list[dict],
+        add_bos: bool = True,
+        add_eos: bool = True,
+    ) -> list[int]:
+        """Build token sequence from transactions with pre-computed date parts.
+
+        Like build_sequence but expects dicts with 'month', 'day', 'weekday'
+        instead of a 'timestamp' datetime object. This avoids expensive
+        datetime.fromisoformat() calls in the hot loop.
+
+        Args:
+            transactions: List of dicts with keys: amount, month, day, weekday, description
+            add_bos: Whether to prepend BOS token.
+            add_eos: Whether to append EOS token.
+
+        Returns:
+            Token ID sequence, truncated to max_seq_len (keeping most recent).
+        """
+        # Tokenize all transactions (using pre-computed date parts)
+        all_token_groups = []
+        for txn in transactions:
+            tokens = [
+                SpecialTokens.amount_sign_token(txn["amount"]),
+                SpecialTokens.amount_bucket_token(txn["amount"]),
+                SpecialTokens.month_token(txn["month"]),
+                SpecialTokens.day_token(txn["day"]),
+                SpecialTokens.weekday_token(txn["weekday"]),
+            ]
+            desc_tokens = self.desc_tokenizer.encode(txn["description"])
+            tokens.extend(desc_tokens[:self.max_desc_tokens])
+            all_token_groups.append(tokens)
+
+        # Build sequence from most recent (reverse, fill budget, then reverse back)
+        sequence = []
+        budget = self.max_seq_len - (1 if add_bos else 0) - (1 if add_eos else 0)
+
+        for tokens in reversed(all_token_groups):
+            needed = len(tokens) + 1
+            if len(sequence) + needed > budget:
+                break
+            sequence.extend(reversed(tokens))
+            sequence.append(SpecialTokens.SEP_TOKEN)
+
+        sequence.reverse()
+
+        if sequence and sequence[0] == SpecialTokens.SEP_TOKEN:
+            sequence = sequence[1:]
+
+        if add_bos:
+            sequence = [SpecialTokens.BOS_TOKEN] + sequence
+        if add_eos:
+            sequence = sequence + [SpecialTokens.EOS_TOKEN]
+
+        return sequence
+
     def pad_sequence(self, sequence: list[int], target_len: Optional[int] = None) -> list[int]:
         """Pad sequence to target_len with PAD tokens."""
         target = target_len or self.max_seq_len

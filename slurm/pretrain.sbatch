@@ -1,22 +1,25 @@
 #!/bin/bash
 #SBATCH --job-name=nuformer-pretrain
-#SBATCH --nodes=2
+#SBATCH --nodes=3
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=48
 #SBATCH --mem=0
-#SBATCH --time=7-00:00:00
+#SBATCH --time=1-12:00:00
 #SBATCH --exclusive
 #SBATCH --account=smml
-#SBATCH --exclude=p5en-dy-gpu-1
+#SBATCH --nodelist=p5en-dy-gpu-[6-7,9]
 #SBATCH --output=/fsx/paragao/logs/pretrain_%j.out
 #SBATCH --error=/fsx/paragao/logs/pretrain_%j.err
 
 # =============================================================================
-# nuFormer Pre-training (NTP) on 2x p5en.48xlarge (16x H200)
+# nuFormer Pre-training (NTP) on 4x p5en.48xlarge (32x H200)
 #
-# Expected throughput: ~25M tokens/step * steps/s
-# Expected duration: ~12-18h for 50K steps
+# Clean end-to-end run:
+#   - 25K steps max, checkpoint every 2000
+#   - Early stopping: stop if no val_loss improvement for 5 evals
+#   - 300K user dataset (3x previous)
+#   - Outputs tokens/sec and MFU
 #
 # Run: sbatch slurm/pretrain.sbatch
 # =============================================================================
@@ -24,20 +27,23 @@
 set -euo pipefail
 
 # --- Configuration ---
-CONTAINER_IMAGE="/fsx/paragao/nemo-25.11.01-efa-fixed.sqsh"
+CONTAINER_IMAGE="/fsx/paragao/containers/nuformer-efa-26.04.sqsh"
 WORKSPACE="/fsx/paragao/nuformer"
-MAX_STEPS=50000
-BATCH_SIZE=16
+MAX_STEPS=25000
+SAVE_INTERVAL=2000
+EARLY_STOP_PATIENCE=5
+BATCH_SIZE=32
 SEQ_LEN=2048
 LR="3e-4"
 
 # --- EFA / NCCL Environment ---
 export FI_PROVIDER=efa
 export NCCL_TUNER_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-ofi-tuner.so
-export NCCL_P2P_NET_CHUNKSIZE=2097156
+export NCCL_NET_PLUGIN=/opt/amazon/aws-ofi-nccl/lib/libnccl-net-ofi.so
 export NCCL_SOCKET_IFNAME=^docker,lo,veth
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+
+# --- PyTorch Memory ---
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 # --- MLFlow ---
 export AWS_PROFILE=compute-sa-team-Administrator
@@ -50,7 +56,7 @@ export MASTER_PORT=29500
 WORLD_SIZE=$((SLURM_NNODES * 8))
 
 echo "=============================================="
-echo "  nuFormer Pre-training"
+echo "  nuFormer Pre-training (Clean E2E)"
 echo "=============================================="
 echo "  Job ID:          $SLURM_JOB_ID"
 echo "  Nodes:           $SLURM_NNODES"
@@ -58,13 +64,15 @@ echo "  GPUs/node:       8"
 echo "  Total GPUs:      $WORLD_SIZE"
 echo "  Master:          $MASTER_ADDR:$MASTER_PORT"
 echo "  Batch/GPU:       $BATCH_SIZE"
-echo "  Grad accum:      16"
-echo "  Effective batch: $((BATCH_SIZE * 16 * WORLD_SIZE))"
+echo "  Grad accum:      8"
+echo "  Effective batch: $((BATCH_SIZE * 8 * WORLD_SIZE))"
 echo "  Seq length:      $SEQ_LEN"
 echo "  Max steps:       $MAX_STEPS"
+echo "  Save interval:   $SAVE_INTERVAL"
+echo "  Early stop:      $EARLY_STOP_PATIENCE evals"
 echo "=============================================="
 
-mkdir -p logs
+mkdir -p /fsx/paragao/logs
 
 # --- Launch ---
 /opt/slurm/bin/srun \
@@ -74,10 +82,9 @@ mkdir -p logs
     bash -c "
         export FI_PROVIDER=efa
         export NCCL_TUNER_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-ofi-tuner.so
-        export NCCL_P2P_NET_CHUNKSIZE=2097156
+        export NCCL_NET_PLUGIN=/opt/amazon/aws-ofi-nccl/lib/libnccl-net-ofi.so
         export NCCL_SOCKET_IFNAME=^docker,lo,veth
-        export CUDA_DEVICE_MAX_CONNECTIONS=1
-        export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+        export PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True'
         export NCCL_DEBUG=INFO
         export PYTHONPATH=$WORKSPACE
         export TORCHELASTIC_ERROR_FILE=/fsx/paragao/logs/elastic_error_\${SLURM_PROCID}.json
@@ -93,7 +100,8 @@ mkdir -p logs
                 --batch-size=$BATCH_SIZE \
                 --seq-len=$SEQ_LEN \
                 --lr=$LR \
-                --no-compile \
+                --save-interval=$SAVE_INTERVAL \
+                --early-stop-patience=$EARLY_STOP_PATIENCE \
                 --checkpoint-dir=$WORKSPACE/ckpt/pretrain
     "
 

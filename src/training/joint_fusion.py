@@ -39,12 +39,12 @@ class JointFusionConfig:
     """Joint fusion training configuration."""
 
     # Data
-    train_sequences_path: str = "data/processed/train_sequences.npy"
-    train_labels_path: str = "data/processed/train_labels.npy"
-    train_features_path: str = "data/processed/train_features.npy"
-    val_sequences_path: str = "data/processed/val_sequences.npy"
-    val_labels_path: str = "data/processed/val_labels.npy"
-    val_features_path: str = "data/processed/val_features.npy"
+    train_sequences_path: str = "data/processed_300k/train_sequences.npy"
+    train_labels_path: str = "data/processed_300k/train_labels.npy"
+    train_features_path: str = "data/processed_300k/train_features.npy"
+    val_sequences_path: str = "data/processed_300k/val_sequences.npy"
+    val_labels_path: str = "data/processed_300k/val_labels.npy"
+    val_features_path: str = "data/processed_300k/val_features.npy"
     max_seq_len: int = 2048
 
     # Pre-trained model
@@ -75,18 +75,21 @@ class JointFusionConfig:
     freeze_transformer: bool = False  # If True, skip LoRA and freeze all transformer params
 
     # Optimization (different LRs per component)
-    batch_size: int = 32
-    gradient_accumulation_steps: int = 4
-    max_steps: int = 10_000
-    warmup_steps: int = 500
+    batch_size: int = 64
+    gradient_accumulation_steps: int = 2
+    max_steps: int = 8_000
+    warmup_steps: int = 300
     transformer_lr: float = 5e-6
-    dcnv2_lr: float = 1e-4
+    dcnv2_lr: float = 3e-4  # Higher for PLR embeddings (Gorishniy et al.)
     fusion_lr: float = 5e-5
     min_lr_ratio: float = 0.1
     weight_decay: float = 0.05
     dcnv2_weight_decay: float = 0.2  # stronger for cross layers
     grad_clip: float = 1.0
     label_smoothing: float = 0.1
+
+    # Early stopping
+    early_stop_patience: int = 5  # stop after N evals with no AUC improvement
 
     # Precision
     dtype: str = "bfloat16"
@@ -227,13 +230,18 @@ class JointFusionTrainer:
             dropout=0.0,
         )
 
-        # DCNv2 config
+        # DCNv2 config (with PLR embeddings enabled)
+        plr_dim = getattr(self.config, '_plr_dim', 8)
+        plr_freq = getattr(self.config, '_plr_frequencies', 4)
         dcnv2_config = DCNv2Config(
             input_dim=self.config.num_tabular_features,
             cross_layers=self.config.dcnv2_cross_layers,
             deep_layers=self.config.dcnv2_deep_dims,
             output_dim=self.config.dcnv2_output_dim,
             dropout=self.config.dcnv2_dropout,
+            use_plr=True,
+            plr_dim=plr_dim,
+            plr_frequencies=plr_freq,
         )
 
         # nuFormer config
@@ -318,7 +326,8 @@ class JointFusionTrainer:
         self.train_loader = DataLoader(
             train_dataset, batch_size=self.config.batch_size,
             shuffle=shuffle, sampler=train_sampler,
-            num_workers=4, pin_memory=True, drop_last=True,
+            num_workers=8, pin_memory=True, drop_last=True,
+            persistent_workers=True, prefetch_factor=4,
         )
 
         val_seq = Path(self.config.val_sequences_path)
@@ -331,7 +340,9 @@ class JointFusionTrainer:
                 self.config.max_seq_len,
             )
             self.val_loader = DataLoader(
-                val_dataset, batch_size=self.config.batch_size, num_workers=2
+                val_dataset, batch_size=self.config.batch_size,
+                num_workers=4, pin_memory=True,
+                persistent_workers=True, prefetch_factor=4,
             )
         else:
             self.val_loader = None
@@ -439,19 +450,26 @@ class JointFusionTrainer:
 
         if self.rank == 0:
             effective_batch = cfg.batch_size * cfg.gradient_accumulation_steps * self.world_size
+            plr_dim = getattr(cfg, '_plr_dim', 8)
+            plr_freq = getattr(cfg, '_plr_frequencies', 4)
             print(f"\n{'='*60}")
-            print(f"  nuFormer Joint Fusion Training")
+            print(f"  nuFormer Joint Fusion Training (PLR + DCNv2)")
             print(f"{'='*60}")
             print(f"  Max steps:        {cfg.max_steps:,}")
             print(f"  Effective batch:  {effective_batch}")
             print(f"  Tabular features: {cfg.num_tabular_features}")
-            print(f"  DCNv2 layers:     {cfg.dcnv2_cross_layers}")
+            print(f"  DCNv2 layers:     {cfg.dcnv2_cross_layers} cross, deep={cfg.dcnv2_deep_dims}")
+            print(f"  PLR:              enabled (dim={plr_dim}, freq={plr_freq})")
+            print(f"  LoRA rank:        {cfg.lora_rank}")
+            print(f"  Label smoothing:  {cfg.label_smoothing}")
+            print(f"  Early stop:       patience={cfg.early_stop_patience}")
             print(f"{'='*60}\n")
 
         self.model.train()
         train_iter = iter(self.train_loader)
         running_loss = 0.0
         t0 = time.time()
+        no_improve_count = 0  # Early stopping counter
 
         while self.step < cfg.max_steps:
             # Update LR (scale applied to base LRs)
@@ -502,16 +520,25 @@ class JointFusionTrainer:
                 running_loss = 0.0
                 t0 = time.time()
 
-            # Eval
+            # Eval + early stopping
             if self.step % cfg.eval_interval == 0:
                 metrics = self.evaluate()
                 if self.rank == 0 and metrics:
                     m_str = " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
                     print(f"  [EVAL] step {self.step}: {m_str}")
 
-                    if metrics.get("val_auc", 0) > self.best_auc:
-                        self.best_auc = metrics["val_auc"]
+                    val_auc = metrics.get("val_auc", 0)
+                    if val_auc > self.best_auc:
+                        self.best_auc = val_auc
+                        no_improve_count = 0
                         self._save(f"{cfg.checkpoint_dir}/best.pt")
+                    else:
+                        no_improve_count += 1
+
+                    if no_improve_count >= cfg.early_stop_patience:
+                        print(f"  [EARLY STOP] No AUC improvement for "
+                              f"{cfg.early_stop_patience} evals. Best: {self.best_auc:.4f}")
+                        break
 
             # Periodic save
             if self.step % cfg.save_interval == 0:
@@ -547,15 +574,32 @@ def main():
 
     parser = argparse.ArgumentParser(description="nuFormer Joint Fusion Training")
     parser.add_argument("--pretrain-ckpt", default="ckpt/pretrain/final.pt")
-    parser.add_argument("--max-steps", type=int, default=10_000)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--max-steps", type=int, default=8_000)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--transformer-lr", type=float, default=5e-6)
-    parser.add_argument("--dcnv2-lr", type=float, default=1e-4)
+    parser.add_argument("--dcnv2-lr", type=float, default=3e-4)
     parser.add_argument("--fusion-lr", type=float, default=5e-5)
     parser.add_argument("--freeze-transformer", action="store_true",
                         help="Freeze transformer (feature extractor only)")
     parser.add_argument("--checkpoint-dir", type=str, default="ckpt/joint_fusion")
+
+    # v2 overrides (PLR / DCNv2 architecture)
+    parser.add_argument("--plr-dim", type=int, default=8,
+                        help="PLR embedding dimension per feature")
+    parser.add_argument("--plr-frequencies", type=int, default=4,
+                        help="Number of sin/cos frequency pairs for PLR")
+    parser.add_argument("--cross-layers", type=int, default=3,
+                        help="Number of DCNv2 cross layers")
+    parser.add_argument("--deep-layers", type=str, default="512,256",
+                        help="Comma-separated deep network layer dims")
+    parser.add_argument("--lora-rank", type=int, default=16,
+                        help="LoRA adapter rank")
+    parser.add_argument("--label-smoothing", type=float, default=0.1,
+                        help="Label smoothing factor")
     args = parser.parse_args()
+
+    # Parse deep layers from comma-separated string
+    deep_layers = [int(x) for x in args.deep_layers.split(",")]
 
     config = JointFusionConfig(
         pretrain_checkpoint=args.pretrain_ckpt,
@@ -566,7 +610,15 @@ def main():
         fusion_lr=args.fusion_lr,
         freeze_transformer=args.freeze_transformer,
         checkpoint_dir=args.checkpoint_dir,
+        lora_rank=args.lora_rank,
+        label_smoothing=args.label_smoothing,
+        dcnv2_deep_dims=deep_layers,
+        dcnv2_cross_layers=args.cross_layers,
     )
+
+    # Store PLR overrides for model setup (passed via config attributes)
+    config._plr_dim = args.plr_dim
+    config._plr_frequencies = args.plr_frequencies
 
     trainer = JointFusionTrainer(config)
     trainer.train()

@@ -27,6 +27,11 @@ class DCNv2Config:
     dropout: float = 0.1
     weight_decay: float = 0.01  # Important for regularization per paper
 
+    # PLR embedding (Gorishniy et al. 2022) — applied before cross/deep networks
+    use_plr: bool = True
+    plr_dim: int = 8  # Embedding dim per feature (4 sin + 4 cos)
+    plr_frequencies: int = 4  # Number of frequency pairs
+
     def __post_init__(self):
         if self.deep_layers is None:
             self.deep_layers = [512, 256]
@@ -58,21 +63,39 @@ class CrossLayer(nn.Module):
 
 
 class DCNv2(nn.Module):
-    """Deep & Cross Network v2.
+    """Deep & Cross Network v2 with optional PLR embeddings.
 
     Combines cross network (explicit feature interactions) with
     deep network (implicit interactions) for tabular features.
 
     Architecture:
-        Input -> [CrossNetwork || DeepNetwork] -> Concat -> OutputProjection
+        Input -> [PLR Embedding] -> [CrossNetwork || DeepNetwork] -> Concat -> OutputProjection
+
+    When use_plr=True, raw numerical features are first embedded via
+    periodic linear representations (learned sin/cos frequencies per feature),
+    then projected back to input_dim before feeding into cross/deep networks.
     """
 
     def __init__(self, config: DCNv2Config):
         super().__init__()
         self.config = config
 
-        # Input normalization (critical for un-standardized tabular features)
-        self.input_norm = nn.BatchNorm1d(config.input_dim)
+        # PLR embedding (optional, applied before cross/deep)
+        if config.use_plr:
+            from .numerical_embeddings import NumericalFeatureEmbedder
+            self.plr_embedder = NumericalFeatureEmbedder(
+                n_numerical_features=config.input_dim,
+                embedding_dim_per_feature=config.plr_dim,
+                n_frequencies=config.plr_frequencies,
+            )
+            # Project PLR output (input_dim * plr_dim) back to input_dim
+            plr_output_dim = config.input_dim * config.plr_dim
+            self.plr_proj = nn.Linear(plr_output_dim, config.input_dim)
+            self.input_norm = nn.LayerNorm(config.input_dim)
+        else:
+            self.plr_embedder = None
+            self.plr_proj = None
+            self.input_norm = nn.BatchNorm1d(config.input_dim)
 
         # Cross network
         self.cross_layers = nn.ModuleList([
@@ -108,7 +131,12 @@ class DCNv2(nn.Module):
         Returns:
             Feature embedding (B, output_dim)
         """
-        # Normalize input
+        # PLR embedding: (B, 291) -> embed -> (B, 291*8) -> project -> (B, 291)
+        if self.plr_embedder is not None:
+            x = self.plr_embedder(x)
+            x = self.plr_proj(x)
+
+        # Normalize
         x = self.input_norm(x)
 
         # Cross network

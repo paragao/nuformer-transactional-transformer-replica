@@ -28,6 +28,7 @@ class DescriptionTokenizer:
         self._id_to_word: dict[int, str] = {}
         self._next_id = 0
         self._use_hf = False
+        self._encode_cache: dict[str, list[int]] = {}
 
         if tokenizer_path and Path(tokenizer_path).exists():
             self._load(tokenizer_path)
@@ -42,12 +43,19 @@ class DescriptionTokenizer:
             self._use_hf = False
 
     def encode(self, text: str) -> list[int]:
-        """Encode text to token IDs (offset by BPE_OFFSET)."""
+        """Encode text to token IDs (offset by BPE_OFFSET). Cached."""
+        cached = self._encode_cache.get(text)
+        if cached is not None:
+            return cached
+
         if self._use_hf and self._tokenizer is not None:
             ids = self._tokenizer.encode(text).ids
-            return [token_id + self.bpe_offset for token_id in ids]
+            result = [token_id + self.bpe_offset for token_id in ids]
         else:
-            return self._encode_simple(text)
+            result = self._encode_simple(text)
+
+        self._encode_cache[text] = result
+        return result
 
     def decode(self, token_ids: list[int]) -> str:
         """Decode token IDs back to text."""

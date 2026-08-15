@@ -34,8 +34,9 @@ checkpoints/
 *.pth
 *.safetensors
 
-# Logs
-logs/
+# Logs (keep training summaries, ignore raw logs)
+!/logs/
+logs/*.log
 mlruns/
 wandb/
 *.log
