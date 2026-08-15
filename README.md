@@ -121,8 +121,8 @@ Transaction Sequence (B, T)
 ┌──────────────────────────────────┐
 │  Causal Transformer (NoPE)       │
 │  24 layers, d=1024, 16 heads     │
-│  FlashAttention, LoRA r=16       │
-│  329M params (2.4M trainable)    │
+│  FlashAttention, LoRA r=16-32   │
+│  329M params (2.4-4.0M trainable)|
 └───────────────┬──────────────────┘
                 |
         last-token embedding (B, 1024)
@@ -131,23 +131,22 @@ Transaction Sequence (B, T)
                 |                                   v
                 |                    ┌──────────────────────────────┐
                 |                    │  PLR Embeddings              │
-                |                    │  291 features x 8-dim each   │
-                |                    │  (4 sin + 4 cos per feature) │
+                |                    │  291 features x 8/16-dim     │
                 |                    │  Learned frequencies/phases  │
                 |                    └──────────────┬───────────────┘
                 |                                   |
-                |                           (B, 291*8=2328)
+                |                           (B, 291*d_plr)
                 |                                   |
                 |                                   v
                 |                    ┌──────────────────────────────┐
                 |                    │  Linear Projection           │
-                |                    │  2328 -> 291                 │
+                |                    │  (291*d_plr) -> 291          │
                 |                    └──────────────┬───────────────┘
                 |                                   |
                 |                                   v
                 |                    ┌──────────────────────────────┐
                 |                    │  DCNv2 (Deep & Cross Net v2) │
-                |                    │  3 cross layers + MLP        │
+                |                    │  3-5 cross layers + MLP      │
                 |                    │  [512, 256] deep layers      │
                 |                    │  -> 128-dim output           │
                 |                    └──────────────┬───────────────┘
@@ -169,7 +168,7 @@ Transaction Sequence (B, T)
                         logits (B, 2)
 ```
 
-**Total Parameters**: 330.7M (3.97M trainable = 1.2%)
+**Total Parameters**: ~330M (3.97-4.5M trainable depending on config; see v1/v2 tables below)
 
 ---
 
@@ -241,8 +240,14 @@ sbatch slurm/joint_fusion.sbatch
 
 - **Task**: End-to-end training with PLR embeddings + DCNv2 + Transformer (LoRA)
 - **Config**: PLR dim=8, 3 cross layers, DCNv2 LR=3e-4, batch=64/GPU, early stop patience=5
-- **Result**: AUC=0.8935+ (surpasses 0.89 target by step 800)
+- **Result**: AUC=0.8938 (surpasses 0.89 target by step 800)
 - **Output**: `ckpt/joint_fusion/best.pt`
+
+For the enhanced v2 configuration (AUC=0.8941):
+
+```bash
+sbatch slurm/joint_fusion_v2.sbatch
+```
 
 ### Step 7: Evaluation
 

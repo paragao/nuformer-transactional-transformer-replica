@@ -1,4 +1,4 @@
-# nuFormer Replication: Paper Findings & Implementation Plan
+# nuFormer Replication: Paper Findings & Implementation Notes
 
 ## Paper: "Your Spending Needs Attention: Modeling Financial Habits with Transformers"
 
@@ -151,54 +151,20 @@ Where:
 
 ---
 
-## 3. NVIDIA Tools Investigation
+## 3. NVIDIA Tools Evaluation
 
-### 3.1 NeMo Safe Synthesizer (for Tabular Features)
+Investigated during planning but not used in the final pipeline:
 
-**Verdict: HIGHLY RELEVANT**
+- **NeMo Safe Synthesizer**: Considered for generating synthetic tabular features with realistic
+  inter-feature correlations. Not used — custom generator (`src/synthetic_data/`) provided full
+  control over distributions and label signals.
+- **NeMo Curator**: Considered for semantic deduplication of transaction descriptions. Not needed —
+  template-based generation already ensures diversity without duplicates.
+- **PersonaLedger** (arXiv:2601.03149): Used as reference for realistic transaction amount
+  distributions and temporal patterns. Informed our distribution parameters in Section 6.
 
-NeMo Safe Synthesizer is an LLM-based tabular data synthesizer that:
-- Fine-tunes a language model (SmolLM3-3B) on your tabular data
-- Learns patterns, correlations, and statistical properties
-- Generates new synthetic records preserving data utility
-- Supports time-series mode for ordered transaction sequences
-- Has built-in evaluation reports comparing synthetic vs. original distributions
-
-**Our use case**: Generate realistic 291-dim tabular feature vectors with inter-feature correlations that would be hard to create manually.
-
-**Pipeline**:
-1. Create seed dataset (1K users) with hand-crafted correlations
-2. Configure Safe Synthesizer in time-series mode (acct_id grouping, txn_index ordering)
-3. Fine-tune SmolLM3-3B on seed tabular data
-4. Generate 100K+ synthetic user feature rows
-5. Validate with built-in KS-test, correlation preservation metrics
-
-### 3.2 NeMo Curator (for Quality Control)
-
-**Verdict: USEFUL for description deduplication**
-
-NeMo Curator provides:
-- Semantic deduplication using embeddings (all-MiniLM-L6-v2)
-- K-means clustering + pairwise cosine similarity within clusters
-- 90% similarity threshold for near-duplicate removal
-- Quality filtering (rule-based + model-based)
-
-**Our use case**: Ensure diversity in synthetic transaction descriptions.
-
-**Pipeline**:
-```
-Generate descriptions -> Rule-based filters -> Semantic dedup (Curator) -> Quality scoring
-```
-
-### 3.3 PersonaLedger (Reference Dataset)
-
-The PersonaLedger paper (arXiv:2601.03149) provides:
-- 24.7M synthetic transactions from 22K+ personas
-- Rule-grounded LLM generation (Llama-3.3-70B)
-- Realistic amounts: mean $66.24, std $184.46 (power-law)
-- Merchant categories: 74,623 unique merchant names
-- Temporal patterns: ~50 txns/month average
-- Sign-log transformation: `sign(amount) * log(1 + |amount|)`
+The NVIDIA NGC container (`nvcr.io/nvidia/nemo:26.04`) was used as the base image for the
+CUDA/PyTorch/NCCL stack.
 
 ---
 
@@ -218,11 +184,10 @@ The PersonaLedger paper (arXiv:2601.03149) provides:
 | **Custom architecture** | Easy (standard nn.Module) | Must conform to Megatron specs |
 
 **Decision**: PyTorch Native with:
-- `torch.compile(mode="max-autotune")` for kernel fusion
-- `flash-attn>=2.6` for FlashAttention-3 on H200
-- `transformer-engine>=1.13` for FP8 support
-- FSDP2 with hybrid sharding for multi-node
-- DCP for distributed checkpointing
+- `flash-attn>=2.6` for FlashAttention on H200
+- DDP (DistributedDataParallel) for single-node 8-GPU training
+- BF16 mixed precision via `torch.amp`
+- Standard `torch.save` checkpointing
 
 ---
 
@@ -230,8 +195,9 @@ The PersonaLedger paper (arXiv:2601.03149) provides:
 
 ### Cluster
 - **Access**: `ssh p5en.smml.aiml.aws.dev`
-- **Nodes**: 16 total (Slurm), **6 available** for this project
-- **GPU**: p5en.48xlarge = 8x H200 (141GB HBM3e) per node = **48 H200s total**
+- **Nodes**: 16 total (Slurm)
+- **GPU**: p5en.48xlarge = 8x H200 (141GB HBM3e) per node
+- **Used**: 1 node (8x H200) for all training runs
 - **Network**: 16 EFA interfaces/node, 3200 Gbps
 - **Container**: Enroot + Pyxis on Slurm
 
@@ -270,20 +236,41 @@ The PersonaLedger paper (arXiv:2601.03149) provides:
 ### 6.2 Seasonal Multipliers
 - Nov: 1.15x | Dec: 1.30x | Jan: 0.85x | Feb: 0.95x | Mar-Oct: 1.0x
 
-### 6.3 Label: Credit Card Activation
-- Binary: did user activate a credit card within 6 months?
-- Positive rate: ~15% (class imbalanced)
-- Signal: spending patterns, transaction diversity, income stability
+### 6.3 Label: Fraud Detection
+- Binary: is the user involved in fraudulent transactions?
+- Positive rate: ~5% (class imbalanced)
+- Signal: anomalous transaction patterns, velocity, geographic inconsistency
 
 ---
 
-## 7. Implementation Timeline
+## 7. Implementation Results
 
-| Phase | Branch | Duration | Deliverable |
-|-------|--------|----------|-------------|
-| 0 | `main` | Day 1 | Repo, FINDINGS.md, Dockerfile, .gitignore |
-| 1 | `phase-1-data-generation` | Days 1-3 | Synthetic data generator + validation set |
-| 2 | `phase-2-tokenization` | Days 3-4 | Tokenization pipeline + memmap datasets |
-| 3 | `phase-3-models` | Days 4-6 | 330M Transformer, DCNv2, nuFormer |
-| 4 | `phase-4-training` | Days 6-12 | Pretrain/Finetune/JointFusion + Slurm |
-| 5 | `phase-5-evaluation` | Days 12-14 | Metrics, ablation, MLFlow, scaling laws |
+| Phase | Branch | Outcome |
+|-------|--------|---------|
+| 0 | `main` | Repo setup, FINDINGS.md, Dockerfile, .gitignore |
+| 1 | `phase-1-data-generation` | 300K synthetic users (transactions + 291 tabular features) |
+| 2 | `phase-2-tokenization` | BPE tokenizer (24K vocab) + sequence builder |
+| 3 | `phase-3-models` | 329M Transformer, DCNv2+PLR, NuFormer |
+| 4 | `phase-4-training` | Pretrain (PPL 1.6) + Finetune (AUC 0.83) |
+| 5 | `phase-5-evaluation` | Joint Fusion v1 (AUC 0.8938), v2 (AUC 0.8941) |
+
+---
+
+## 8. Replication vs Paper
+
+| Aspect | Paper (Nubank) | Our Replication |
+|--------|---------------|-----------------|
+| Data | 100M+ real users, 100B+ txns | 300K synthetic users |
+| Pre-training | PPL not disclosed | PPL 1.6 |
+| Baseline (LoRA only) | Not directly comparable | AUC 0.8296 |
+| Joint Fusion gain | +1.25% relative AUC over LightGBM | +7.7% absolute AUC over LoRA-only |
+| DCNv2 without embeddings | -0.40% (worse) | Not tested (PLR always enabled) |
+| PLR contribution | "Critical" per ablation | +0.064 AUC (LoRA to Joint Fusion) |
+| Training scale | Multi-node, weeks | 1 node (8x H200), ~4h |
+
+**Key differences:**
+- Paper uses real production data (100M users); we use 300K synthetic — the AUC ceiling
+  (~0.894) likely reflects synthetic data limitations rather than model capacity
+- Paper reports *relative* improvement over LightGBM; our baseline is transformer-only LoRA
+- Paper doesn't disclose absolute AUC values, making direct comparison impossible
+- Our replication validates the architecture and training methodology, not the exact numbers
