@@ -270,15 +270,14 @@ python scripts/evaluate.py --checkpoint ckpt/joint_fusion/best.pt
 
 ### Step 9: Batch Inference
 
+Run inference on raw (non-tokenized) transaction data using a trained checkpoint.
+The pipeline handles tokenization on-the-fly — no pre-processing required.
+
 ```bash
 sbatch slurm/inference.sbatch
 ```
 
-Runs inference on raw (non-tokenized) transaction data using the trained model. Accepts
-transactions.parquet + tabular_features.parquet, tokenizes on-the-fly, and outputs per-user
-fraud probabilities to `predictions/`.
-
-Alternatively, run directly:
+Or run directly (e.g., for testing on a smaller dataset):
 
 ```bash
 python scripts/batch_inference.py \
@@ -286,8 +285,56 @@ python scripts/batch_inference.py \
     --tokenizer tokenizer/tokenizer.json \
     --transactions data/raw_300k/transactions.parquet \
     --features data/raw_300k/tabular_features.parquet \
-    --output predictions.parquet
+    --output predictions.parquet \
+    --batch-size 128 \
+    --threshold 0.5
 ```
+
+**Output format** (parquet):
+
+| Column | Description |
+|--------|-------------|
+| `user_id` | User identifier |
+| `fraud_probability` | Model output (0.0 to 1.0) |
+| `predicted_label` | Binary decision (1 if probability >= threshold) |
+| `confidence` | How confident the model is in its prediction |
+
+**Interpreting results:**
+
+- The training data has a ~15% positive base rate. A well-behaved model should predict
+  positive rates in a similar range on similar data.
+- The default threshold of 0.5 is arbitrary. Adjust it based on your precision/recall
+  tradeoff requirements (lower threshold = more positives, higher recall, lower precision).
+- Use `scripts/evaluate.py` with ground truth labels to measure actual model performance
+  (AUC, AP, calibration).
+
+**Quick test with the Slurm job:**
+
+You can override any parameter via environment variables without editing the sbatch file:
+
+```bash
+# Use a different checkpoint
+CHECKPOINT=/fsx/paragao/nuformer/ckpt/joint_fusion/best.pt sbatch slurm/inference.sbatch
+
+# Point to different input data
+TRANSACTIONS=/fsx/paragao/nuformer/data/test/transactions.parquet \
+FEATURES=/fsx/paragao/nuformer/data/test/tabular_features.parquet \
+sbatch slurm/inference.sbatch
+```
+
+**Expected input data format:**
+
+`transactions.parquet` must contain columns: `user_id`, `timestamp`, `amount`, `description`
+
+`tabular_features.parquet` must contain a `user_id` column plus 291 numeric feature columns
+(matching the training schema).
+
+**Performance notes:**
+
+On 1x H200, scoring 300K users (~1,600 transactions/user) takes approximately 90 minutes total,
+with tokenization dominating (~60% of runtime). GPU inference itself runs at ~1,000+ users/s.
+For faster runs, pre-tokenize data using `scripts/process_data.py` and use the training
+evaluation pipeline directly.
 
 ---
 
@@ -397,6 +444,10 @@ python scripts/batch_inference.py \
 | `scripts/generate_data.py` | Data generation entrypoint |
 | `scripts/process_data.py` | Data processing pipeline |
 | `scripts/evaluate.py` | Model evaluation script |
+| `scripts/batch_inference.py` | End-to-end inference (raw data → predictions) |
+| `scripts/train_tokenizer.py` | Standalone BPE tokenizer training |
+| `tokenizer/tokenizer.json` | Pre-trained BPE tokenizer (251 tokens + 78 special) |
+| `slurm/inference.sbatch` | Batch inference job script (1x GPU) |
 | `logs/` | Training summaries for all phases |
 | `FINDINGS.md` | Paper analysis and implementation notes |
 
