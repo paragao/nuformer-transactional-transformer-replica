@@ -200,15 +200,28 @@ Generates 300K synthetic financial users with:
 - 291 tabular features (280 numerical + 11 one-hot categorical)
 - Binary fraud labels (~5% positive rate)
 
-### Step 3: Process Data
+### Step 3: Train Tokenizer
+
+```bash
+sbatch slurm/train_tokenizer.sbatch
+```
+
+Trains a BPE tokenizer (24K vocab) on transaction descriptions and saves to `tokenizer/tokenizer.json`.
+This tokenizer is used by all downstream scripts (processing, inference).
+
+> **Note**: A pre-trained tokenizer is included in the repo at `tokenizer/tokenizer.json`.
+> You only need to re-run this step if the transaction corpus changes.
+
+### Step 4: Process Data
 
 ```bash
 sbatch slurm/process_data.sbatch
 ```
 
 Converts raw data to numpy arrays (`train_sequences.npy`, `train_features.npy`, `train_labels.npy`, etc.) with train/val split.
+Supports loading the saved tokenizer via `--tokenizer tokenizer/tokenizer.json`.
 
-### Step 4: Pre-training (Self-Supervised)
+### Step 5: Pre-training (Self-Supervised)
 
 ```bash
 sbatch slurm/pretrain.sbatch
@@ -219,7 +232,7 @@ sbatch slurm/pretrain.sbatch
 - **Result**: Converges to PPL=1.6 (val_loss=0.4817), early stops at step 6,000
 - **Output**: `ckpt/pretrain/final.pt`
 
-### Step 5: Fine-tuning (Optional Baseline)
+### Step 6: Fine-tuning (Optional Baseline)
 
 ```bash
 sbatch slurm/finetune.sbatch
@@ -232,7 +245,7 @@ sbatch slurm/finetune.sbatch
 
 This establishes a transformer-only baseline. Joint Fusion significantly surpasses this.
 
-### Step 6: Joint Fusion Training
+### Step 7: Joint Fusion Training
 
 ```bash
 sbatch slurm/joint_fusion.sbatch
@@ -249,11 +262,79 @@ For the enhanced v2 configuration (AUC=0.8941):
 sbatch slurm/joint_fusion_v2.sbatch
 ```
 
-### Step 7: Evaluation
+### Step 8: Evaluation
 
 ```bash
 python scripts/evaluate.py --checkpoint ckpt/joint_fusion/best.pt
 ```
+
+### Step 9: Batch Inference
+
+Run inference on raw (non-tokenized) transaction data using a trained checkpoint.
+The pipeline handles tokenization on-the-fly — no pre-processing required.
+
+```bash
+sbatch slurm/inference.sbatch
+```
+
+Or run directly (e.g., for testing on a smaller dataset):
+
+```bash
+python scripts/batch_inference.py \
+    --checkpoint ckpt/joint_fusion_v2/best.pt \
+    --tokenizer tokenizer/tokenizer.json \
+    --transactions data/raw_300k/transactions.parquet \
+    --features data/raw_300k/tabular_features.parquet \
+    --output predictions.parquet \
+    --batch-size 128 \
+    --threshold 0.5
+```
+
+**Output format** (parquet):
+
+| Column | Description |
+|--------|-------------|
+| `user_id` | User identifier |
+| `fraud_probability` | Model output (0.0 to 1.0) |
+| `predicted_label` | Binary decision (1 if probability >= threshold) |
+| `confidence` | How confident the model is in its prediction |
+
+**Interpreting results:**
+
+- The training data has a ~15% positive base rate. A well-behaved model should predict
+  positive rates in a similar range on similar data.
+- The default threshold of 0.5 is arbitrary. Adjust it based on your precision/recall
+  tradeoff requirements (lower threshold = more positives, higher recall, lower precision).
+- Use `scripts/evaluate.py` with ground truth labels to measure actual model performance
+  (AUC, AP, calibration).
+
+**Quick test with the Slurm job:**
+
+You can override any parameter via environment variables without editing the sbatch file:
+
+```bash
+# Use a different checkpoint
+CHECKPOINT=/fsx/paragao/nuformer/ckpt/joint_fusion/best.pt sbatch slurm/inference.sbatch
+
+# Point to different input data
+TRANSACTIONS=/fsx/paragao/nuformer/data/test/transactions.parquet \
+FEATURES=/fsx/paragao/nuformer/data/test/tabular_features.parquet \
+sbatch slurm/inference.sbatch
+```
+
+**Expected input data format:**
+
+`transactions.parquet` must contain columns: `user_id`, `timestamp`, `amount`, `description`
+
+`tabular_features.parquet` must contain a `user_id` column plus 291 numeric feature columns
+(matching the training schema).
+
+**Performance notes:**
+
+On 1x H200, scoring 300K users (~1,600 transactions/user) takes approximately 90 minutes total,
+with tokenization dominating (~60% of runtime). GPU inference itself runs at ~1,000+ users/s.
+For faster runs, pre-tokenize data using `scripts/process_data.py` and use the training
+evaluation pipeline directly.
 
 ---
 
@@ -363,6 +444,10 @@ python scripts/evaluate.py --checkpoint ckpt/joint_fusion/best.pt
 | `scripts/generate_data.py` | Data generation entrypoint |
 | `scripts/process_data.py` | Data processing pipeline |
 | `scripts/evaluate.py` | Model evaluation script |
+| `scripts/batch_inference.py` | End-to-end inference (raw data → predictions) |
+| `scripts/train_tokenizer.py` | Standalone BPE tokenizer training |
+| `tokenizer/tokenizer.json` | Pre-trained BPE tokenizer (251 tokens + 78 special) |
+| `slurm/inference.sbatch` | Batch inference job script (1x GPU) |
 | `logs/` | Training summaries for all phases |
 | `FINDINGS.md` | Paper analysis and implementation notes |
 

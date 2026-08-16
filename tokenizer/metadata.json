@@ -1,0 +1,10 @@
+{
+  "vocab_size": 24000,
+  "actual_bpe_vocab": 251,
+  "total_vocab_with_special": 329,
+  "num_special_tokens": 78,
+  "bpe_offset": 78,
+  "num_unique_descriptions": 90,
+  "trained_on": "/fsx/paragao/nuformer/tokenizer",
+  "date": "2026-08-15T17:42:02.929604"
+}

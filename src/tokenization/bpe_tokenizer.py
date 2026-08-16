@@ -33,6 +33,24 @@ class DescriptionTokenizer:
         if tokenizer_path and Path(tokenizer_path).exists():
             self._load(tokenizer_path)
 
+    @classmethod
+    def from_pretrained(cls, path: str) -> "DescriptionTokenizer":
+        """Load a pre-trained tokenizer from a saved file.
+
+        Args:
+            path: Path to saved tokenizer.json file
+
+        Returns:
+            Loaded DescriptionTokenizer ready for encode/decode
+
+        Raises:
+            FileNotFoundError: If the tokenizer file doesn't exist
+        """
+        if not Path(path).exists():
+            raise FileNotFoundError(f"Tokenizer not found at: {path}")
+        instance = cls(tokenizer_path=path)
+        return instance
+
     def train(self, texts: list[str], save_path: Optional[str] = None) -> None:
         """Train tokenizer on a corpus of description texts."""
         try:

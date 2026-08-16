@@ -43,8 +43,12 @@ def load_data(input_dir: Path) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame
     return transactions, labels, features
 
 
-def build_tokenizer(transactions: pl.DataFrame) -> DescriptionTokenizer:
-    """Train BPE tokenizer on transaction descriptions."""
+def build_tokenizer(transactions: pl.DataFrame, tokenizer_path: str = None) -> DescriptionTokenizer:
+    """Load pre-trained or train BPE tokenizer on transaction descriptions."""
+    if tokenizer_path and Path(tokenizer_path).exists():
+        print(f"  Loading pre-trained tokenizer from {tokenizer_path}")
+        return DescriptionTokenizer.from_pretrained(tokenizer_path)
+
     descriptions = transactions["description"].unique().to_list()
     print(f"  Training BPE on {len(descriptions):,} unique descriptions...")
     tokenizer = DescriptionTokenizer(vocab_size=24000)
@@ -261,6 +265,8 @@ def main():
     parser.add_argument("--bpe-vocab-size", type=int, default=24000)
     parser.add_argument("--workers", type=int, default=0,
                         help="Number of parallel workers (0 = auto-detect CPU count)")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        help="Path to pre-trained tokenizer.json (if not provided, trains from data)")
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
@@ -285,7 +291,7 @@ def main():
     # Train tokenizer
     print("\n[2/4] Training BPE tokenizer...")
     t0 = time.time()
-    desc_tokenizer = build_tokenizer(transactions)
+    desc_tokenizer = build_tokenizer(transactions, tokenizer_path=args.tokenizer)
     print(f"  BPE vocab: {desc_tokenizer.vocab_size} tokens")
     print(f"  Trained in {time.time()-t0:.1f}s")
 
